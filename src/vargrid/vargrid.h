@@ -8,27 +8,25 @@
 #include "pch.h"
 using namespace bom;
 
-// Build the observation operator for a single altitude layer.
-auto build_observation_operator(
+// Precompute projected coordinates for all radar gates (main thread only).
+auto precompute_gate_projections(
       volume const& vol
     , string const& proj4_string
-    , grid_coordinates const& coords
+    ) -> gate_projections;
+
+// Build the observation operator for a single altitude layer (thread-safe).
+auto build_observation_operator(
+      volume const& vol
+    , gate_projections const& gp
+    , double x0    // x center of first grid cell (projected meters)
+    , double y0    // y center of first grid cell (projected meters)
+    , double dx    // x cell spacing (projected meters)
+    , double dy    // y cell spacing (projected meters)
     , size_t grid_nx
     , size_t grid_ny
     , float altitude
     , const vargrid_config& cfg
     ) -> observation_operator;
-
-// Variational gridding of a radar volume to a single altitude layer.
-auto variational_grid(
-      volume const& vol
-    , string const& proj4_string
-    , grid_coordinates const& coords
-    , size_t grid_nx
-    , size_t grid_ny
-    , float altitude
-    , const vargrid_config& cfg
-    ) -> array2f;
 
 // Variational gridding with a precomputed observation operator.
 auto variational_grid(

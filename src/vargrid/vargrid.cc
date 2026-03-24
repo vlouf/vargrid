@@ -8,8 +8,6 @@
 using namespace bom;
 
 // Compute a nearest-gate initial guess for faster CG convergence.
-// For each grid cell with observations, use the weighted mean of
-// observations. For cells without observations, leave as background.
 static void compute_initial_guess(
     float* x,
     const observation_operator& H,
@@ -17,7 +15,6 @@ static void compute_initial_guess(
 {
   size_t n = H.grid_size();
 
-  // Accumulate weighted sum and weight sum per grid cell
   std::vector<float> wsum(n, 0.0f);
   std::vector<float> wcount(n, 0.0f);
 
@@ -34,9 +31,7 @@ static void compute_initial_guess(
   }
 }
 
-// Mark grid cells with no observations and no observed neighbours as nodata.
-// These cells are unconstrained by the cost function and would just
-// contain the background value with no physical meaning.
+// Mark unconstrained grid cells as nodata.
 static void mask_unconstrained(
     float* x,
     const observation_operator& H)
@@ -45,20 +40,12 @@ static void mask_unconstrained(
   size_t nx = H.grid_nx;
   size_t ny = H.grid_ny;
 
-  // First pass: find cells that have at least one observation
-  // within a neighbourhood radius. A cell is "constrained" if it
-  // has direct observations OR is adjacent to a cell with observations.
-  // We propagate this outward a few steps so the smoothness term
-  // has a chance to spread information.
-
   constexpr int propagation_steps = 3;
   std::vector<bool> has_data(n, false);
 
-  // Seed: cells with direct observations
   for (size_t i = 0; i < n; ++i)
     has_data[i] = (H.obs_count[i] > 0);
 
-  // Propagate through neighbours
   std::vector<bool> next(n, false);
   for (int step = 0; step < propagation_steps; ++step) {
     for (size_t j = 0; j < ny; ++j) {
@@ -68,7 +55,6 @@ static void mask_unconstrained(
           next[idx] = true;
           continue;
         }
-        // Check 4-connected neighbours
         bool neighbour_has_data = false;
         if (i > 0      && has_data[idx - 1])  neighbour_has_data = true;
         if (i < nx - 1 && has_data[idx + 1])  neighbour_has_data = true;
@@ -80,26 +66,10 @@ static void mask_unconstrained(
     std::swap(has_data, next);
   }
 
-  // Set unconstrained cells to nodata
   for (size_t i = 0; i < n; ++i) {
     if (!has_data[i])
       x[i] = nodata;
   }
-}
-
-auto variational_grid(
-      volume const& vol
-    , string const& proj4_string
-    , grid_coordinates const& coords
-    , size_t grid_nx
-    , size_t grid_ny
-    , float altitude
-    , const vargrid_config& cfg
-    ) -> array2f
-{
-  auto H = build_observation_operator(vol, proj4_string, coords, grid_nx, grid_ny, altitude, cfg);
-
-  return variational_grid(H, cfg);
 }
 
 auto variational_grid(
@@ -111,10 +81,8 @@ auto variational_grid(
   size_t ny = H.grid_ny;
   size_t n = H.grid_size();
 
-  // Allocate the solution field
   auto result = array2f{vec2z{nx, ny}};
 
-  // Set initial guess
   float bg = std::isnan(cfg.background) ? 0.0f : cfg.background;
 
   if (cfg.use_nearest_init) {
@@ -124,7 +92,6 @@ auto variational_grid(
       result.data()[i] = bg;
   }
 
-  // Run the CG solver if there are observations
   if (!H.obs.empty()) {
     auto sr = solve_cg(result.data(), H, cfg);
     trace::log("  Variational grid: {} iterations, cost={:.4f}, residual={:.2e}, converged={}",
@@ -133,7 +100,6 @@ auto variational_grid(
     trace::warning("  Variational grid: no observations for this layer");
   }
 
-  // Mask areas with no observational constraint
   mask_unconstrained(result.data(), H);
 
   return result;

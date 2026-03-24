@@ -2,6 +2,7 @@
 #define VARGRID_OBSERVATION_OPERATOR_H
 
 #include <vector>
+#include <string>
 #include <cstddef>
 #include <cmath>
 
@@ -13,27 +14,28 @@ struct observation {
   float alt_dist;     // Altitude distance from target (for diagnostics)
 };
 
-// The observation operator H maps from radar polar coordinates to the
-// Cartesian grid. For each altitude layer, it collects all radar gates
-// that are close enough to the target altitude, computes which grid cell
-// each gate falls into, and assigns a quality weight.
-//
-// This is a sparse operator: most grid cells have 0-3 contributing
-// observations from different sweeps.
-//
-// The operator is built once per altitude layer and reused across
-// solver iterations.
+// The observation operator H: sparse mapping from radar gates to grid cells.
 struct observation_operator {
-  std::vector<observation> obs;  // All observations for this layer
-
+  std::vector<observation> obs;
   size_t grid_nx;
   size_t grid_ny;
-
-  // Number of observations contributing to each grid cell.
-  // Used to identify data-void regions.
   std::vector<int> obs_count;
 
   auto grid_size() const -> size_t { return grid_nx * grid_ny; }
+};
+
+// Precomputed projected coordinates for all radar gates in all sweeps.
+// Computed once on the main thread (PROJ is not thread-safe),
+// then shared read-only across worker threads.
+struct sweep_projections {
+  std::vector<double> px;  // projected x (easting) per gate [nrays * nbins]
+  std::vector<double> py;  // projected y (northing) per gate [nrays * nbins]
+  size_t nrays;
+  size_t nbins;
+};
+
+struct gate_projections {
+  std::vector<sweep_projections> sweeps;
 };
 
 #endif // VARGRID_OBSERVATION_OPERATOR_H

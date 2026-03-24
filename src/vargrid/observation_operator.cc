@@ -14,11 +14,9 @@ static auto compute_weight(
     , const vargrid_config& cfg
     ) -> float
 {
-  // Range-based weight: Gaussian decay with range_scale
   float w_range = std::exp(-0.5f * (ground_range * ground_range)
                            / (cfg.range_scale * cfg.range_scale));
 
-  // Altitude-based weight: linear decay to zero at max_alt_diff
   float w_alt = 1.0f - std::fabs(alt_dist) / max_alt_diff;
   if (w_alt < 0.0f) w_alt = 0.0f;
 
@@ -26,13 +24,70 @@ static auto compute_weight(
   return std::max(w, cfg.min_weight);
 }
 
-// Build the observation operator for a single altitude layer.
-// Maps radar gates to the Cartesian grid using the map projection.
-// Takes the proj4 string so each thread can create its own projection context.
-auto build_observation_operator(
+// Precompute projected coordinates for all radar gates.
+// Must be called from the main thread (single-threaded) because
+// PROJ is not safe to use concurrently with shared contexts.
+auto precompute_gate_projections(
       volume const& vol
     , string const& proj4_string
-    , grid_coordinates const& coords
+    ) -> gate_projections
+{
+  gate_projections gp;
+
+  auto radarloc = latlon{vol.location.lon, vol.location.lat};
+  auto geo = map_projection{map_projection::default_context, "+proj=longlat +datum=WGS84"};
+  auto proj = map_projection{map_projection::default_context, proj4_string};
+
+  gp.sweeps.resize(vol.sweeps.size());
+
+  for (size_t iscan = 0; iscan < vol.sweeps.size(); ++iscan) {
+    auto& scan = vol.sweeps[iscan];
+    auto nrays = scan.rays.size();
+    auto nbins = scan.bins.size();
+
+    gp.sweeps[iscan].nrays = nrays;
+    gp.sweeps[iscan].nbins = nbins;
+
+    // Build arrays of lon/lat for all gates in this sweep
+    std::vector<double> lons(nrays * nbins);
+    std::vector<double> lats(nrays * nbins);
+
+    for (size_t iray = 0; iray < nrays; ++iray) {
+      for (size_t ibin = 0; ibin < nbins; ++ibin) {
+        auto gate_ll = wgs84.bearing_range_to_latlon(
+          radarloc,
+          scan.rays[iray],
+          scan.bins[ibin].ground_range
+        );
+        size_t idx = iray * nbins + ibin;
+        lons[idx] = gate_ll.lon.degrees();
+        lats[idx] = gate_ll.lat.degrees();
+      }
+    }
+
+    // Batch transform: geographic -> projected CRS
+    auto sx = span<double>{lons.data(), lons.size()};
+    auto sy = span<double>{lats.data(), lats.size()};
+    map_projection::transform(geo, proj, sx, sy);
+
+    // After transform, lons[] contains easting (x), lats[] contains northing (y)
+    gp.sweeps[iscan].px = std::move(lons);
+    gp.sweeps[iscan].py = std::move(lats);
+  }
+
+  return gp;
+}
+
+// Build the observation operator for a single altitude layer.
+// Uses precomputed projected gate coordinates — fully thread-safe,
+// no PROJ calls needed.
+auto build_observation_operator(
+      volume const& vol
+    , gate_projections const& gp
+    , double x0
+    , double y0
+    , double dx
+    , double dy
     , size_t grid_nx
     , size_t grid_ny
     , float altitude
@@ -44,35 +99,12 @@ auto build_observation_operator(
   H.grid_ny = grid_ny;
   H.obs_count.resize(grid_nx * grid_ny, 0);
 
-  // Find the top scan (excluded, same logic as CAPPI)
+  // Find the top scan (excluded)
   size_t topscan = 0;
   for (size_t iscan = 1; iscan < vol.sweeps.size(); iscan++) {
     if (vol.sweeps[iscan].beam.elevation() > vol.sweeps[topscan].beam.elevation())
       topscan = iscan;
   }
-
-  // Grid geometry in projected coordinates (meters).
-  // Use cell edges to compute cell centers and spacing.
-  auto col_edges = coords.col_edges();
-  auto row_edges = coords.row_edges();
-
-  // Cell centers
-  std::vector<double> x_centers(grid_nx), y_centers(grid_ny);
-  for (size_t i = 0; i < grid_nx; ++i)
-    x_centers[i] = 0.5 * (col_edges[i] + col_edges[i + 1]);
-  for (size_t j = 0; j < grid_ny; ++j)
-    y_centers[j] = 0.5 * (row_edges[j] + row_edges[j + 1]);
-
-  // Cell spacing (assumed uniform)
-  double dx = x_centers[1] - x_centers[0];
-  double dy = y_centers[1] - y_centers[0];
-
-  auto radarloc = latlon{vol.location.lon, vol.location.lat};
-
-  // Each call creates its own projection objects for thread safety.
-  // PROJ contexts are not safe to share across threads.
-  auto geo = map_projection{map_projection::default_context, "+proj=longlat +datum=WGS84"};
-  auto local_proj = map_projection{map_projection::default_context, proj4_string};
 
   size_t total_obs = 0;
   size_t out_of_bounds = 0;
@@ -82,6 +114,7 @@ auto build_observation_operator(
       continue;
 
     auto& scan = vol.sweeps[iscan];
+    auto& sp = gp.sweeps[iscan];
 
     for (size_t ibin = 0; ibin < scan.bins.size(); ++ibin) {
       float alt_dist = scan.bins[ibin].altitude - altitude;
@@ -97,23 +130,13 @@ auto build_observation_operator(
         if (std::fabs(val - undetect) < 0.1f)
           continue;
 
-        // Compute the lat/lon of this gate
-        auto gate_ll = wgs84.bearing_range_to_latlon(
-          radarloc,
-          scan.rays[iray],
-          scan.bins[ibin].ground_range
-        );
-
-        // Transform gate from geographic to the grid's projected CRS.
-        double px = gate_ll.lon.degrees();
-        double py = gate_ll.lat.degrees();
-        auto sx = span<double>{&px, 1};
-        auto sy = span<double>{&py, 1};
-        map_projection::transform(geo, local_proj, sx, sy);
+        size_t pidx = iray * sp.nbins + ibin;
+        double px = sp.px[pidx];
+        double py = sp.py[pidx];
 
         // Convert projected coordinates to grid indices
-        double fx = (px - x_centers[0]) / dx;
-        double fy = (py - y_centers[0]) / dy;
+        double fx = (px - x0) / dx;
+        double fy = (py - y0) / dy;
 
         int ix = static_cast<int>(std::round(fx));
         int iy = static_cast<int>(std::round(fy));
@@ -140,7 +163,7 @@ auto build_observation_operator(
     }
   }
 
-  trace::debug("  Observation operator: {} obs collected, {} out of bounds, altitude={:.0f}m",
+  trace::debug("  Observation operator: {} obs, {} out of bounds, alt={:.0f}m",
     total_obs, out_of_bounds, altitude);
 
   return H;

@@ -108,7 +108,6 @@ constexpr struct option long_options[] =
   , { 0, 0, 0, 0 }
 };
 
-// Simple RAII timer for logging phase durations.
 struct phase_timer {
   std::string name;
   std::chrono::high_resolution_clock::time_point start;
@@ -156,40 +155,16 @@ auto read_single_moment(
   return {vol, dset};
 }
 
-auto grid_layer(
-      volume const& vol
-    , array2<latlon> const& latlons
-    , string const& proj4_string
-    , grid_coordinates const& coords
-    , io::configuration const& config
-    , float altitude
-    , const std::string& method
-    ) -> array2f
+auto parse_vargrid_config(io::configuration const& config) -> vargrid_config
 {
-  if (method == "variational")
-  {
-    vargrid_config cfg;
-    cfg.alpha = std::stof(config.optional("vargrid_alpha", "1.0"));
-    cfg.max_alt_diff = std::stof(config.optional("vargrid_max_alt_diff", "2000"));
-    cfg.max_iterations = std::stoi(config.optional("vargrid_max_iterations", "50"));
-    cfg.tolerance = std::stof(config.optional("vargrid_tolerance", "1e-5"));
-    cfg.range_scale = std::stof(config.optional("vargrid_range_scale", "150000"));
-    cfg.use_nearest_init = config.optional("vargrid_use_nearest_init", "true") == "true";
-
-    return variational_grid(vol, proj4_string, coords,
-      latlons.extents().x, latlons.extents().y,
-      altitude, cfg);
-  }
-  else
-  {
-    return generate_cappi(
-        vol
-      , latlons
-      , config["max_alt_dist"]
-      , config["idw_pwr"]
-      , altitude
-    );
-  }
+  vargrid_config cfg;
+  cfg.alpha = std::stof(config.optional("vargrid_alpha", "1.0"));
+  cfg.max_alt_diff = std::stof(config.optional("vargrid_max_alt_diff", "2000"));
+  cfg.max_iterations = std::stoi(config.optional("vargrid_max_iterations", "50"));
+  cfg.tolerance = std::stof(config.optional("vargrid_tolerance", "1e-5"));
+  cfg.range_scale = std::stof(config.optional("vargrid_range_scale", "150000"));
+  cfg.use_nearest_init = config.optional("vargrid_use_nearest_init", "true") == "true";
+  return cfg;
 }
 
 auto run_gridding(
@@ -212,8 +187,10 @@ auto run_gridding(
     };
   auto latlons = determine_geodetic_coordinates(proj, coords);
   auto altitudes = init_altitudes(config);
+  auto grid_nx = latlons.extents().x;
+  auto grid_ny = latlons.extents().y;
   trace::log("Grid: {}x{}, {} altitude layers ({:.0f}m to {:.0f}m)",
-    latlons.extents().x, latlons.extents().y, altitudes.size(),
+    grid_nx, grid_ny, altitudes.size(),
     altitudes[0], altitudes[altitudes.size()-1]);
 
   // Read the volume
@@ -229,6 +206,27 @@ auto run_gridding(
   auto moment_name = (string) config["moment"];
   auto method = config.optional("gridding_method", "cappi");
   trace::log("Gridding method: {}, moment: {}", method, moment_name);
+
+  // Precompute gate projections on the main thread (PROJ is not thread-safe).
+  gate_projections gp;
+  double x0 = 0, y0 = 0, dx = 1, dy = 1;
+  if (method == "variational") {
+    phase_timer t("Precomputing gate projections");
+    gp = precompute_gate_projections(vol, proj4_string);
+
+    // Compute grid cell centers and spacing from the grid_coordinates edges.
+    auto col_edges = coords.col_edges();
+    auto row_edges = coords.row_edges();
+    x0 = 0.5 * (col_edges[0] + col_edges[1]);
+    y0 = 0.5 * (row_edges[0] + row_edges[1]);
+    double x_last = 0.5 * (col_edges[grid_nx - 1] + col_edges[grid_nx]);
+    double y_last = 0.5 * (row_edges[grid_ny - 1] + row_edges[grid_ny]);
+    dx = (x_last - x0) / (static_cast<double>(grid_nx) - 1.0);
+    dy = (y_last - y0) / (static_cast<double>(grid_ny) - 1.0);
+    trace::debug("Grid origin: ({:.1f}, {:.1f}), spacing: ({:.1f}, {:.1f})", x0, y0, dx, dy);
+  }
+
+  auto vcfg = parse_vargrid_config(config);
 
   // Get grid coordinates for output
   auto y = array1d{coords.row_edges()};
@@ -255,14 +253,12 @@ auto run_gridding(
   trace::log("Creating output file: {}", out_path.string());
   auto out_file = io::nc::file{out_path, io_mode::create};
 
-  // Create dimensions
   auto& dim_x = io::cf::create_spatial_dimension(out_file, "x", "projection_x_coordinate", coords.col_units(), coords.col_edges());
   auto& dim_y = io::cf::create_spatial_dimension(out_file, "y", "projection_y_coordinate", coords.row_units(), y);
   auto& dim_e = out_file.create_dimension("elevation", dset.elevation.size());
   auto& dim_a = out_file.create_dimension("z", altitudes.size());
   auto& dim_nrad = out_file.create_dimension("nradar", 1);
 
-  // Coordinate variables
   auto& var_e = out_file.create_variable("elevation", io::nc::data_type::f64, {&dim_e});
   auto& var_a = out_file.create_variable("z", io::nc::data_type::f64, {&dim_a});
   auto& var_lon = out_file.create_variable("longitude", io::nc::data_type::f32, {&dim_y, &dim_x}, {dim_y.size(), dim_x.size()});
@@ -271,13 +267,11 @@ auto run_gridding(
   auto& var_rlat = out_file.create_variable("radar_latitude", io::nc::data_type::f64, {&dim_nrad});
   auto& var_rlon = out_file.create_variable("radar_longitude", io::nc::data_type::f64, {&dim_nrad});
   auto& var_ralt = out_file.create_variable("radar_altitude", io::nc::data_type::f64, {&dim_nrad});
-  io::cf::create_grid_mapping(out_file, "proj", config["proj4"].string(), "", "m", "m");
+  io::cf::create_grid_mapping(out_file, "proj", proj4_string, "", "m", "m");
 
-  // Data variable
   auto& var_data = out_file.create_variable(moment_name, io::nc::data_type::f32,
     {&dim_a, &dim_y, &dim_x}, {1, dim_y.size(), dim_x.size()});
 
-  // Write coordinates
   var_e.write(dset.elevation);
   var_a.write(altitudes);
   var_lon.write(lon);
@@ -287,7 +281,6 @@ auto run_gridding(
   var_rlon.write(radar_lon);
   var_ralt.write(radar_alt);
 
-  // Set attributes
   set_nc_var_attrs(var_a, "altitude");
   set_nc_var_attrs(var_lon, "longitude");
   set_nc_var_attrs(var_lat, "latitude");
@@ -299,13 +292,12 @@ auto run_gridding(
     set_nc_var_attrs(var_data, "reflectivity");
   var_data.att_set("_FillValue", nodata);
 
-  // NetCDF metadata
   out_file.att_set("source", dset.source);
   out_file.att_set("date", dset.date);
   out_file.att_set("time", dset.time);
   out_file.att_set("lowest_sweep_time", dset.lowest_sweep_time);
   out_file.att_set("date_created", to_string(bom::timestamp::now()));
-  out_file.att_set("projection", config["proj4"].string());
+  out_file.att_set("projection", proj4_string);
   out_file.att_set("gridding_method", method);
 
   // Process each altitude layer
@@ -327,7 +319,17 @@ auto run_gridding(
         if (i >= altitudes.size())
           break;
 
-        auto gridded = grid_layer(vol, latlons, proj4_string, coords, config, altitudes[i], method);
+        array2f gridded;
+        if (method == "variational") {
+          auto H = build_observation_operator(
+            vol, gp, x0, y0, dx, dy,
+            grid_nx, grid_ny, altitudes[i], vcfg);
+          gridded = variational_grid(H, vcfg);
+        } else {
+          gridded = generate_cappi(
+            vol, latlons, config["max_alt_dist"],
+            config["idw_pwr"], altitudes[i]);
+        }
 
         if (config["origin"].string().compare("xy") == 0)
           flipud(gridded);
@@ -349,7 +351,6 @@ int main(int argc, char* argv[])
 {
   try
   {
-    // Process command line
     while (true)
     {
       int option_index = 0;
@@ -384,7 +385,6 @@ int main(int argc, char* argv[])
 
     auto config = io::configuration{std::ifstream{positional_args[0]}};
 
-    // Validate origin
     auto origin = config["origin"].string();
     if (origin != "ij" && origin != "xy") {
       trace::error("Invalid origin '{}'. Must be 'ij' or 'xy'.", origin);
