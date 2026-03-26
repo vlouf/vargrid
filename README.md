@@ -14,7 +14,7 @@ vargrid reads ODIM HDF5 radar volumes and produces CF-compliant NetCDF files on 
 
 ## Dependencies
 
-- **bom-util** and **bom-core** — Bureau of Meteorology C++ utility and radar libraries
+- **[bom-util]** and **[bom-core]** — Bureau of Meteorology C++ utility and radar libraries
 - **HDF5** — for reading ODIM polar volume files
 - **NetCDF** — for writing gridded output
 - **PROJ** — for map projection (geographic ↔ projected coordinate transforms)
@@ -24,7 +24,7 @@ vargrid reads ODIM HDF5 radar volumes and produces CF-compliant NetCDF files on 
 
 ```bash
 mkdir build && cd build
-cmake .. -DCMAKE_INSTALL_PREFIX=/opt/bom
+cmake ..
 make
 ```
 
@@ -140,13 +140,6 @@ vargrid/
 │       ├── solver.h                   — Polak-Ribière CG solver (header-only)
 │       ├── variational.h/cc           — Variational gridding driver
 │       └── cappi.h/cc                 — CAPPI IDW gridding
-└── test/
-    ├── test_harness.h                 — Minimal test framework
-    ├── test_main.cc                   — Test runner
-    ├── test_laplacian.cc              — Laplacian operator verification
-    ├── test_cost_function.cc          — Gradient vs finite differences
-    ├── test_solver.cc                 — CG convergence tests
-    └── test_field_selection.cc        — Include/exclude logic
 ```
 
 ## How it works
@@ -168,3 +161,6 @@ Radar gates are mapped to the Cartesian grid by projecting their geographic coor
 ### CAPPI
 
 The CAPPI method finds the two nearest sweeps above and below the target altitude for each grid cell and interpolates using inverse distance weighting. Sweeps are pre-sorted by elevation for early termination.
+
+[bom-util]: https://gitlab.com/bom-radar/bom-util
+[bom-core]: https://gitlab.com/bom-radar/bom-core
