@@ -1,5 +1,45 @@
 #include "writer.h"
 
+// Known packing ranges for ODIM quantities.
+// These are fixed ranges that cover the full physical range of each variable.
+auto get_packing_info(const std::string& quantity) -> packing_info
+{
+  // {valid_min, valid_max, scale_factor (computed), add_offset (computed), enabled}
+  static const std::unordered_map<std::string, std::pair<float, float>> ranges = {
+    {"DBZH",       {-33.0f,  95.0f}},
+    {"DBZH_CLEAN", {-33.0f,  95.0f}},
+    {"DBZV",       {-33.0f,  95.0f}},
+    {"TH",         {-33.0f,  95.0f}},
+    {"TV",         {-33.0f,  95.0f}},
+    {"VRADH",      {-75.0f,  75.0f}},
+    {"VRADDH",     {-75.0f,  75.0f}},
+    {"VRADV",      {-75.0f,  75.0f}},
+    {"WRADH",      {0.0f,    30.0f}},
+    {"WRADV",      {0.0f,    30.0f}},
+    {"ZDR",        {-8.0f,   12.0f}},
+    {"RHOHV",      {0.0f,     1.1f}},
+    {"PHIDP",      {-180.0f, 180.0f}},
+    {"KDP",        {-2.0f,   15.0f}},
+    {"SQI",        {0.0f,     1.0f}},
+    {"SNR",        {-30.0f,  70.0f}},
+    {"SNRH",       {-30.0f,  70.0f}},
+    {"CCOR",       {-40.0f,  10.0f}},
+    {"CCORH",      {-40.0f,  10.0f}},
+  };
+
+  auto it = ranges.find(quantity);
+  if (it != ranges.end()) {
+    packing_info pi;
+    pi.valid_min = it->second.first;
+    pi.valid_max = it->second.second;
+    pi.enabled = true;
+    pi.compute();
+    return pi;
+  }
+
+  return {0, 0, 0, 0, false};
+}
+
 auto set_cf_field_attributes(io::nc::variable& var, const std::string& quantity) -> void
 {
   static const std::unordered_map<std::string, std::tuple<std::string, std::string, std::string>> cf_map = {
@@ -34,7 +74,6 @@ auto set_cf_field_attributes(io::nc::variable& var, const std::string& quantity)
     var.att_set("long_name", quantity);
   }
 
-  var.att_set("_FillValue", nodata);
   var.att_set("grid_mapping", "proj");
   var.att_set("coordinates", "latitude longitude");
 }
@@ -60,6 +99,62 @@ auto set_cf_coord_attributes(io::nc::variable& var, const std::string& coord_typ
   }
 }
 
+// Pack a float array to int16 using scale_factor/add_offset.
+// NaN values are mapped to fill_value (-32768).
+// Values outside [valid_min, valid_max] are clamped.
+static void pack_float_to_short(
+    const float* src,
+    short* dst,
+    size_t n,
+    const packing_info& pi)
+{
+  constexpr short fill_value = -32768;
+  float inv_scale = 1.0f / pi.scale_factor;
+
+  for (size_t i = 0; i < n; ++i) {
+    if (std::isnan(src[i])) {
+      dst[i] = fill_value;
+    } else {
+      // Clamp to valid range
+      float val = src[i];
+      if (val < pi.valid_min) val = pi.valid_min;
+      if (val > pi.valid_max) val = pi.valid_max;
+
+      // Pack: packed = (value - add_offset) / scale_factor
+      float packed = (val - pi.add_offset) * inv_scale;
+
+      // Round to nearest integer, clamp to [-32767, 32767]
+      int p = static_cast<int>(std::round(packed));
+      if (p < -32767) p = -32767;
+      if (p > 32767) p = 32767;
+      dst[i] = static_cast<short>(p);
+    }
+  }
+}
+
+void output_context::write_field(const std::string& field, const array2f& data, size_t layer_index)
+{
+  auto* var = data_vars.at(field);
+
+  if (use_packing && packing.count(field) && packing.at(field).enabled) {
+    // Pack float -> int16 and write
+    auto& pi = packing.at(field);
+    size_t n = data.size();
+    std::vector<short> packed(n);
+    pack_float_to_short(data.data(), packed.data(), n, pi);
+
+    // Write packed data using the BOM array type
+    auto packed_arr = array2<short>{data.extents()};
+    for (size_t i = 0; i < n; ++i)
+      packed_arr.data()[i] = packed[i];
+
+    var->write(packed_arr, {layer_index});
+  } else {
+    // Write as float32
+    var->write(data, {layer_index});
+  }
+}
+
 auto create_output_file(
       const std::filesystem::path& path
     , grid_coordinates const& coords
@@ -72,6 +167,7 @@ auto create_output_file(
     , const std::string& method
     , const std::vector<std::string>& fields
     , bool output_obs_count
+    , bool pack_output
     , array1d const& radar_lat
     , array1d const& radar_lon
     , array1d const& radar_alt
@@ -80,6 +176,7 @@ auto create_output_file(
   auto out_file = io::nc::file{path, io_mode::create};
   output_context ctx;
   ctx.file = &out_file;
+  ctx.use_packing = pack_output;
 
   // CF global attributes
   out_file.att_set("Conventions", "CF-1.10");
@@ -117,7 +214,6 @@ auto create_output_file(
   auto& var_ralt = out_file.create_variable("radar_altitude", io::nc::data_type::f64, {&dim_nrad});
   io::cf::create_grid_mapping(out_file, "proj", proj4_string, "", "m", "m");
 
-  // Coordinate attributes
   set_cf_coord_attributes(var_a, "altitude");
   var_a.att_set("positive", "up");
   set_cf_coord_attributes(var_lon, "longitude");
@@ -127,7 +223,6 @@ auto create_output_file(
   set_cf_coord_attributes(var_rlon, "radar_longitude");
   set_cf_coord_attributes(var_ralt, "radar_altitude");
 
-  // Write coordinate data
   var_e.write(meta.elevation);
   var_a.write(altitudes);
   var_lon.write(lon);
@@ -139,10 +234,38 @@ auto create_output_file(
 
   // Create data variables for each field
   for (auto& field : fields) {
-    auto& var = out_file.create_variable(field, io::nc::data_type::f32,
-      {&dim_a, &dim_y, &dim_x}, {1, dim_y.size(), dim_x.size()});
-    set_cf_field_attributes(var, field);
-    ctx.data_vars[field] = &var;
+    auto pi = get_packing_info(field);
+    ctx.packing[field] = pi;
+
+    if (pack_output && pi.enabled) {
+      // Packed int16 variable
+      auto& var = out_file.create_variable(field, io::nc::data_type::i16,
+        {&dim_a, &dim_y, &dim_x}, {1, dim_y.size(), dim_x.size()});
+      set_cf_field_attributes(var, field);
+
+      // CF packing attributes — readers use: value = packed * scale_factor + add_offset
+      var.att_set("scale_factor", static_cast<double>(pi.scale_factor));
+      var.att_set("add_offset", static_cast<double>(pi.add_offset));
+      var.att_set("_FillValue", static_cast<short>(-32768));
+      var.att_set("valid_min", static_cast<short>(-32767));
+      var.att_set("valid_max", static_cast<short>(32767));
+
+      ctx.data_vars[field] = &var;
+
+      trace::debug("  {} packed: range [{:.1f}, {:.1f}], scale={:.6f}, offset={:.4f}",
+        field, pi.valid_min, pi.valid_max, pi.scale_factor, pi.add_offset);
+    } else {
+      // Float32 variable (unpacked, or unknown field)
+      auto& var = out_file.create_variable(field, io::nc::data_type::f32,
+        {&dim_a, &dim_y, &dim_x}, {1, dim_y.size(), dim_x.size()});
+      set_cf_field_attributes(var, field);
+      var.att_set("_FillValue", nodata);
+
+      ctx.data_vars[field] = &var;
+
+      if (pack_output && !pi.enabled)
+        trace::debug("  {} unpacked (unknown field)", field);
+    }
 
     if (output_obs_count) {
       auto nobs_name = "nobs_" + field;

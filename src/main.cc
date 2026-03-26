@@ -59,6 +59,11 @@ velocity VRADH
 # Output observation count per field (true/false, default false)
 output_obs_count false
 
+# Pack output data as int16 with scale_factor/add_offset (default true).
+# Reduces file size by ~50% with negligible precision loss.
+# Set to false for full float32 output (e.g. for debugging).
+pack_output true
+
 # --- CAPPI parameters (used when gridding_method is "cappi") ---
 max_alt_dist 20000
 idw_pwr 2.0
@@ -158,7 +163,7 @@ static auto parse_vargrid_config(io::configuration const& config, float beamwidt
   cfg.beam_power = std::stof(config.optional("vargrid_beam_power", "2.0"));
   cfg.ref_range = std::stof(config.optional("vargrid_ref_range", "10000"));
   cfg.min_weight = std::stof(config.optional("vargrid_min_weight", "0.01"));
-  cfg.use_nearest_init = config.optional("vargrid_use_nearest_init", "true") == "true";
+  cfg.use_nearest_init = std::string(config.optional("vargrid_use_nearest_init", "true")) != "false";
   cfg.kappa = std::stof(config.optional("vargrid_kappa", "10.0"));
   cfg.beamwidth = beamwidth;
   return cfg;
@@ -220,7 +225,8 @@ static auto run_gridding(
   trace::log("Gridding method: {}", method);
 
   auto vcfg = parse_vargrid_config(config, meta.beamwidth);
-  auto output_obs_count = config.optional("output_obs_count", "false") == "true";
+  auto output_obs_count = std::string(config.optional("output_obs_count", "false")) == "false" ? false : true;
+  auto pack_output = std::string(config.optional("pack_output", "true")) == "false" ? false : true;
 
   // --- Precompute gate projections (variational only, main thread) ---
   gate_projections gp;
@@ -265,7 +271,7 @@ static auto run_gridding(
   trace::log("Creating output file: {}", out_path.string());
   auto [out_file, ctx] = create_output_file(
     out_path, coords, y_edges, lon, lat, altitudes, meta,
-    proj4_string, method, selected_fields, output_obs_count,
+    proj4_string, method, selected_fields, output_obs_count, pack_output,
     radar_lat, radar_lon, radar_alt);
 
   // --- Grid all fields at all layers ---
@@ -309,7 +315,7 @@ static auto run_gridding(
           if (config["origin"].string() == "xy") flipud(gridded);
 
           auto lock = std::lock_guard<std::mutex>{mut_netcdf};
-          ctx.data_vars.at(field)->write(gridded, {i});
+          ctx.write_field(field, gridded, i);
         }
       }
     };
