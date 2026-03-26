@@ -70,8 +70,17 @@ vargrid_max_iterations 50
 # Convergence tolerance (relative gradient norm)
 vargrid_tolerance 1e-5
 
-# Range scale (m) for observation weight decay
-vargrid_range_scale 150000
+# Observation error model: beam volume scaling
+# Weight = (ref_range / slant_range)^beam_power * altitude_weight
+# beam_power=2 gives inverse-area scaling (pulse volume grows as range^2)
+vargrid_beam_power 2.0
+
+# Reference range (m): gates at this range get weight 1.0
+# Gates closer than this are clamped to weight 1.0
+vargrid_ref_range 10000
+
+# Minimum observation weight floor
+vargrid_min_weight 0.01
 
 # Use nearest-gate weighted mean as initial guess
 vargrid_use_nearest_init true
@@ -155,15 +164,18 @@ auto read_single_moment(
   return {vol, dset};
 }
 
-auto parse_vargrid_config(io::configuration const& config) -> vargrid_config
+auto parse_vargrid_config(io::configuration const& config, float beamwidth) -> vargrid_config
 {
   vargrid_config cfg;
   cfg.alpha = std::stof(config.optional("vargrid_alpha", "1.0"));
   cfg.max_alt_diff = std::stof(config.optional("vargrid_max_alt_diff", "2000"));
   cfg.max_iterations = std::stoi(config.optional("vargrid_max_iterations", "50"));
   cfg.tolerance = std::stof(config.optional("vargrid_tolerance", "1e-5"));
-  cfg.range_scale = std::stof(config.optional("vargrid_range_scale", "150000"));
+  cfg.beam_power = std::stof(config.optional("vargrid_beam_power", "2.0"));
+  cfg.ref_range = std::stof(config.optional("vargrid_ref_range", "10000"));
+  cfg.min_weight = std::stof(config.optional("vargrid_min_weight", "0.01"));
   cfg.use_nearest_init = config.optional("vargrid_use_nearest_init", "true") == "true";
+  cfg.beamwidth = beamwidth;
   return cfg;
 }
 
@@ -226,7 +238,7 @@ auto run_gridding(
     trace::debug("Grid origin: ({:.1f}, {:.1f}), spacing: ({:.1f}, {:.1f})", x0, y0, dx, dy);
   }
 
-  auto vcfg = parse_vargrid_config(config);
+  auto vcfg = parse_vargrid_config(config, dset.beamwidth);
 
   // Get grid coordinates for output
   auto y = array1d{coords.row_edges()};

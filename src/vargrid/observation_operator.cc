@@ -6,21 +6,40 @@
 
 using namespace bom;
 
-// Compute observation weight based on range and altitude distance.
+// Compute observation weight (inverse error variance) for a radar gate.
+//
+// The weight models two physical effects:
+//
+// 1. Beam broadening: the radar pulse volume grows with range.
+//    At slant range r, the beam cross-section is ~ (r * beamwidth)^2
+//    in area. A gate at long range averages over a much larger volume
+//    than a nearby gate, making it less representative of a single
+//    grid cell. We model this as w_beam = (ref_range / r)^beam_power.
+//    With beam_power=2, this is inverse-area scaling.
+//
+// 2. Altitude distance: gates further from the target CAPPI altitude
+//    are less relevant. Linear decay to zero at max_alt_diff.
+//
+// The combined weight w = w_beam * w_alt represents R⁻¹ in the
+// variational cost function: higher weight = lower observation error
+// = more trust in this gate.
 static auto compute_weight(
-      float ground_range
+      float slant_range
     , float alt_dist
     , float max_alt_diff
     , const vargrid_config& cfg
     ) -> float
 {
-  float w_range = std::exp(-0.5f * (ground_range * ground_range)
-                           / (cfg.range_scale * cfg.range_scale));
+  // Beam volume weight: close gates get high weight, far gates get low weight.
+  // Clamped so that gates closer than ref_range don't get artificially boosted.
+  float effective_range = std::max(slant_range, cfg.ref_range);
+  float w_beam = std::pow(cfg.ref_range / effective_range, cfg.beam_power);
 
+  // Altitude weight: linear decay
   float w_alt = 1.0f - std::fabs(alt_dist) / max_alt_diff;
   if (w_alt < 0.0f) w_alt = 0.0f;
 
-  float w = w_range * w_alt;
+  float w = w_beam * w_alt;
   return std::max(w, cfg.min_weight);
 }
 
@@ -150,7 +169,7 @@ auto build_observation_operator(
         size_t grid_idx = static_cast<size_t>(iy) * grid_nx + static_cast<size_t>(ix);
 
         float w = compute_weight(
-          scan.bins[ibin].ground_range,
+          scan.bins[ibin].slant_range,
           alt_dist,
           cfg.max_alt_diff,
           cfg

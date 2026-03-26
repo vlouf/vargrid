@@ -20,16 +20,28 @@ struct vargrid_config {
   int max_iterations = 50;     // Maximum CG iterations
   float tolerance = 1e-5f;     // Relative residual tolerance for convergence
 
-  // Observation quality model
-  float range_scale = 150000.f; // Range (m) at which observation weight halves
-  float min_weight = 0.01f;     // Minimum observation weight (floor)
+  // Observation error model
+  // The weight (inverse of observation error variance) for each gate is:
+  //   w = w_beam * w_alt
+  // where:
+  //   w_beam = (ref_range / slant_range)^beam_power
+  //     Models beam broadening: the pulse volume grows with range,
+  //     so far gates average over larger volumes and are less
+  //     representative of a single grid cell.
+  //   w_alt = 1 - |alt_dist| / max_alt_diff
+  //     Linear decay for gates further from the target altitude.
+  float beam_power = 2.0f;       // Exponent for range-dependent weight (2 = inverse area)
+  float ref_range = 10000.f;     // Reference range (m) where w_beam = 1.0
+  float min_weight = 0.01f;      // Floor to prevent zero weights
 
-  // Initial guess strategy: "zero" or "nearest"
-  // "nearest" uses nearest-gate values as starting point (faster convergence)
+  // Radar beamwidth in degrees (used for beam volume computation).
+  // Overridden by the value read from the radar file if available.
+  float beamwidth = 1.0f;
+
+  // Initial guess strategy
   bool use_nearest_init = true;
 
   // Background field value for areas with no observations.
-  // NaN means no background constraint.
   float background = std::numeric_limits<float>::quiet_NaN();
 };
 
