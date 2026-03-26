@@ -2,6 +2,7 @@
 #include <atomic>
 #include <chrono>
 #include <functional>
+#include <set>
 #include "pch.h"
 
 #include "array_operations.h"
@@ -39,50 +40,36 @@ altitude_step 500.0
 # number of layers
 layer_count 13
 
-# radar moment to grid
-moment DBZH
-
 # Matrix orientation
 origin xy
 
 # gridding method: "cappi" (IDW) or "variational"
 gridding_method variational
 
+# velocity field name (for undetect handling)
+velocity VRADH
+
+# Field selection (optional):
+#   include_fields "DBZH VRADH ZDR"    - only grid these fields
+#   exclude_fields "SQI CCOR"          - grid everything except these
+# If neither is set, all fields found in the volume are gridded.
+# include_fields takes precedence if both are set.
+
+# Output observation count per field (true/false, default false)
+output_obs_count false
+
 # --- CAPPI parameters (used when gridding_method is "cappi") ---
-
-# maximum distance from CAPPI altitude to use reflectivities
 max_alt_dist 20000
-
-# exponent for inverse distance weighting
 idw_pwr 2.0
 
-# --- Variational gridding parameters (used when gridding_method is "variational") ---
-
-# Regularisation weight: smoothness vs data fit (larger = smoother)
+# --- Variational gridding parameters ---
 vargrid_alpha 1.0
-
-# Maximum altitude difference (m) for gate selection
 vargrid_max_alt_diff 2000
-
-# Maximum CG iterations
 vargrid_max_iterations 50
-
-# Convergence tolerance (relative gradient norm)
 vargrid_tolerance 1e-5
-
-# Observation error model: beam volume scaling
-# Weight = (ref_range / slant_range)^beam_power * altitude_weight
-# beam_power=2 gives inverse-area scaling (pulse volume grows as range^2)
 vargrid_beam_power 2.0
-
-# Reference range (m): gates at this range get weight 1.0
-# Gates closer than this are clamped to weight 1.0
 vargrid_ref_range 10000
-
-# Minimum observation weight floor
 vargrid_min_weight 0.01
-
-# Use nearest-gate weighted mean as initial guess
 vargrid_use_nearest_init true
 
 )";
@@ -135,33 +122,155 @@ struct phase_timer {
   }
 };
 
-auto read_single_moment(
-      const std::filesystem::path& path
-    , const io::configuration& config
-    ) -> std::pair<volume, radarset>
+// Split a space-separated string into a set of tokens.
+static auto split_fields(const std::string& s) -> std::set<std::string>
 {
-  trace::debug("Reading volume: {}", path.string());
-  io::odim::polar_volume vol_odim{path, io_mode::read_only};
+  std::set<std::string> result;
+  std::istringstream iss(s);
+  std::string token;
+  while (iss >> token)
+    result.insert(token);
+  return result;
+}
 
-  radarset dset;
-  const std::string& moment = config["moment"];
+// Discover all available moment names in an ODIM volume.
+static auto discover_fields(io::odim::polar_volume const& vol_odim) -> std::vector<std::string>
+{
+  std::set<std::string> seen;
+  std::vector<std::string> fields;
 
-  dset.elevation = get_elevation(vol_odim);
-  dset.nyquist = get_nyquist(vol_odim);
-  dset.lowest_sweep_time = get_lowest_sweep_time(vol_odim);
+  for (size_t iscan = 0; iscan < vol_odim.scan_count(); ++iscan) {
+    auto scan_odim = vol_odim.scan_open(iscan);
+    for (size_t idata = 0; idata < scan_odim.data_count(); ++idata) {
+      auto data_odim = scan_odim.data_open(idata);
+      auto qty = data_odim.quantity();
+      if (seen.insert(qty).second)
+        fields.push_back(qty);
+    }
+  }
 
-  auto vol = read_moment(vol_odim, moment, config);
+  return fields;
+}
 
-  const auto& attributes = vol_odim.attributes();
-  dset.source = attributes["source"].get_string();
-  dset.date = attributes["date"].get_string();
-  dset.time = attributes["time"].get_string();
-  dset.beamwidth = attributes["beamwH"].get_real();
+// Determine which fields to grid based on include/exclude config.
+static auto select_fields(
+      std::vector<std::string> const& available
+    , io::configuration const& config
+    ) -> std::vector<std::string>
+{
+  std::string include_str = config.optional("include_fields", "");
+  std::string exclude_str = config.optional("exclude_fields", "");
 
-  trace::debug("Volume read: {} (source={}, moment={}, {} sweeps)",
-    path.string(), dset.source, moment, vol.sweeps.size());
+  if (!include_str.empty()) {
+    auto include_set = split_fields(include_str);
+    std::vector<std::string> result;
+    for (auto& f : available) {
+      if (include_set.count(f))
+        result.push_back(f);
+    }
+    return result;
+  }
 
-  return {vol, dset};
+  if (!exclude_str.empty()) {
+    auto exclude_set = split_fields(exclude_str);
+    std::vector<std::string> result;
+    for (auto& f : available) {
+      if (!exclude_set.count(f))
+        result.push_back(f);
+    }
+    return result;
+  }
+
+  return available;
+}
+
+// Read a single moment into a volume struct.
+static auto read_moment_volume(
+      io::odim::polar_volume const& vol_odim
+    , const std::string& moment
+    , const std::string& velocity_field
+    ) -> volume
+{
+  auto vol = volume{};
+  vol.location.lat = vol_odim.latitude() * 1_deg;
+  vol.location.lon = vol_odim.longitude() * 1_deg;
+  vol.location.alt = vol_odim.height();
+
+  for (size_t iscan = 0; iscan < vol_odim.scan_count(); ++iscan) {
+    auto scan_odim = vol_odim.scan_open(iscan);
+    if (std::fabs(scan_odim.elevation_angle() - 90) < 0.1f)
+      continue;
+
+    auto scan = sweep{};
+    scan.beam = radar::beam_propagation{vol.location.alt, scan_odim.elevation_angle() * 1_deg};
+
+    scan.bins.resize(scan_odim.bin_count());
+    auto range_scale = scan_odim.range_scale();
+    auto range_start = scan_odim.range_start() * 1000 + range_scale * 0.5;
+    for (size_t i = 0; i < scan.bins.size(); ++i) {
+      scan.bins[i].slant_range = range_start + i * range_scale;
+      std::tie(scan.bins[i].ground_range, scan.bins[i].altitude) =
+        scan.beam.ground_range_altitude(scan.bins[i].slant_range);
+    }
+
+    scan.rays.resize(scan_odim.ray_count());
+    auto ray_scale = 360_deg / scan.rays.size();
+    auto ray_start = scan_odim.ray_start() * 1_deg + ray_scale * 0.5;
+    for (size_t i = 0; i < scan.rays.size(); ++i)
+      scan.rays[i] = ray_start + i * ray_scale;
+
+    for (size_t idata = 0; idata < scan_odim.data_count(); ++idata) {
+      auto data_odim = scan_odim.data_open(idata);
+      if (data_odim.quantity() != moment)
+        continue;
+
+      scan.data.resize(vec2z{(size_t)scan_odim.bin_count(), (size_t)scan_odim.ray_count()});
+      if (moment == velocity_field)
+        data_odim.read_unpack(scan.data.data(), undetect, nodata);
+      else
+        data_odim.read_unpack(scan.data.data(), nodata, nodata);
+
+      vol.sweeps.push_back(std::move(scan));
+      break;
+    }
+  }
+
+  return vol;
+}
+
+// CF-compliant attribute mapping for ODIM quantities.
+static void set_cf_attributes(io::nc::variable& var, const std::string& quantity)
+{
+  static const std::unordered_map<std::string, std::tuple<std::string, std::string, std::string>> cf_map = {
+    {"DBZH",       {"dBZ",           "equivalent_reflectivity_factor",                          "Horizontal reflectivity"}},
+    {"DBZH_CLEAN", {"dBZ",           "equivalent_reflectivity_factor",                          "Filtered horizontal reflectivity"}},
+    {"DBZV",       {"dBZ",           "",                                                        "Vertical reflectivity"}},
+    {"VRADH",      {"m s-1",         "radial_velocity_of_scatterers_away_from_instrument",      "Mean Doppler velocity (H)"}},
+    {"VRADDH",     {"m s-1",         "radial_velocity_of_scatterers_away_from_instrument",      "Dealiased Doppler velocity (H)"}},
+    {"VRADV",      {"m s-1",         "",                                                        "Mean Doppler velocity (V)"}},
+    {"WRADH",      {"m s-1",         "doppler_spectrum_width",                                  "Doppler spectrum width (H)"}},
+    {"ZDR",        {"dB",            "log_differential_reflectivity_hv",                        "Differential reflectivity"}},
+    {"RHOHV",      {"1",             "cross_correlation_ratio_hv",                              "Cross-correlation coefficient"}},
+    {"PHIDP",      {"degrees",       "differential_phase_hv",                                   "Differential phase"}},
+    {"KDP",        {"degrees km-1",  "specific_differential_phase_hv",                          "Specific differential phase"}},
+    {"SQI",        {"1",             "",                                                        "Signal quality index"}},
+    {"SNR",        {"dB",            "signal_to_noise_ratio",                                   "Signal-to-noise ratio"}},
+    {"SNRH",       {"dB",            "signal_to_noise_ratio",                                   "Signal-to-noise ratio (H)"}},
+  };
+
+  auto it = cf_map.find(quantity);
+  if (it != cf_map.end()) {
+    auto& [units, standard_name, long_name] = it->second;
+    if (!units.empty())         var.att_set("units", units);
+    if (!standard_name.empty()) var.att_set("standard_name", standard_name);
+    if (!long_name.empty())     var.att_set("long_name", long_name);
+  } else {
+    var.att_set("long_name", quantity);
+  }
+
+  var.att_set("_FillValue", nodata);
+  var.att_set("grid_mapping", "proj");
+  var.att_set("coordinates", "latitude longitude");
 }
 
 auto parse_vargrid_config(io::configuration const& config, float beamwidth) -> vargrid_config
@@ -205,28 +314,62 @@ auto run_gridding(
     grid_nx, grid_ny, altitudes.size(),
     altitudes[0], altitudes[altitudes.size()-1]);
 
-  // Read the volume
-  volume vol;
-  radarset dset;
-  {
-    phase_timer t("Reading volume");
-    auto [v, d] = read_single_moment(input_path, config);
-    vol = std::move(v);
-    dset = std::move(d);
+  // Open ODIM volume and discover fields
+  io::odim::polar_volume vol_odim{input_path, io_mode::read_only};
+  auto available_fields = discover_fields(vol_odim);
+  auto selected_fields = select_fields(available_fields, config);
+
+  trace::log("Available fields: {}", [&]{
+    std::string s;
+    for (auto& f : available_fields) { if (!s.empty()) s += " "; s += f; }
+    return s;
+  }());
+  trace::log("Selected fields:  {}", [&]{
+    std::string s;
+    for (auto& f : selected_fields) { if (!s.empty()) s += " "; s += f; }
+    return s;
+  }());
+
+  if (selected_fields.empty()) {
+    trace::error("No fields selected for gridding.");
+    return;
   }
 
-  auto moment_name = (string) config["moment"];
-  auto method = config.optional("gridding_method", "cappi");
-  trace::log("Gridding method: {}, moment: {}", method, moment_name);
+  // Read metadata
+  auto elevation = get_elevation(vol_odim);
+  auto nyquist = get_nyquist(vol_odim);
+  auto lowest_sweep_time = get_lowest_sweep_time(vol_odim);
+  const auto& attributes = vol_odim.attributes();
+  auto source = attributes["source"].get_string();
+  auto date_str = attributes["date"].get_string();
+  auto time_str = attributes["time"].get_string();
+  auto beamwidth = attributes["beamwH"].get_real();
 
-  // Precompute gate projections on the main thread (PROJ is not thread-safe).
+  auto velocity_field = config.optional("velocity", "VRADH");
+
+  // Read all selected moments
+  std::map<std::string, volume> volumes;
+  {
+    phase_timer t("Reading " + std::to_string(selected_fields.size()) + " moment(s)");
+    for (auto& field : selected_fields) {
+      volumes[field] = read_moment_volume(vol_odim, field, velocity_field);
+      trace::debug("  {} : {} sweeps", field, volumes[field].sweeps.size());
+    }
+  }
+
+  auto method = config.optional("gridding_method", "cappi");
+  trace::log("Gridding method: {}", method);
+
+  auto vcfg = parse_vargrid_config(config, beamwidth);
+  auto output_obs_count = config.optional("output_obs_count", "false") == "true";
+
+  // Precompute gate projections on main thread
   gate_projections gp;
   double x0 = 0, y0 = 0, dx = 1, dy = 1;
   if (method == "variational") {
     phase_timer t("Precomputing gate projections");
-    gp = precompute_gate_projections(vol, proj4_string);
+    gp = precompute_gate_projections(volumes.begin()->second, proj4_string);
 
-    // Compute grid cell centers and spacing from the grid_coordinates edges.
     auto col_edges = coords.col_edges();
     auto row_edges = coords.row_edges();
     x0 = 0.5 * (col_edges[0] + col_edges[1]);
@@ -238,9 +381,7 @@ auto run_gridding(
     trace::debug("Grid origin: ({:.1f}, {:.1f}), spacing: ({:.1f}, {:.1f})", x0, y0, dx, dy);
   }
 
-  auto vcfg = parse_vargrid_config(config, dset.beamwidth);
-
-  // Get grid coordinates for output
+  // Prepare output coordinates
   auto y = array1d{coords.row_edges()};
   auto lon = array2f{latlons.extents()};
   auto lat = array2f{latlons.extents()};
@@ -248,29 +389,44 @@ auto run_gridding(
     lon.data()[i] = latlons.data()[i].lon.degrees();
     lat.data()[i] = latlons.data()[i].lat.degrees();
   }
-  if (config["origin"].string().compare("xy") == 0) {
+  if (config["origin"].string() == "xy") {
     flip(y);
     flipud(lat);
   }
 
-  // Radar site coordinates
   auto radar_lat = array1d{1};
   auto radar_lon = array1d{1};
   auto radar_alt = array1d{1};
-  radar_lat[0] = vol.location.lat.degrees();
-  radar_lon[0] = vol.location.lon.degrees();
-  radar_alt[0] = vol.location.alt;
+  auto& first_vol = volumes.begin()->second;
+  radar_lat[0] = first_vol.location.lat.degrees();
+  radar_lon[0] = first_vol.location.lon.degrees();
+  radar_alt[0] = first_vol.location.alt;
 
-  // Create output file
+  // --- Create CF-compliant output NetCDF ---
   trace::log("Creating output file: {}", out_path.string());
   auto out_file = io::nc::file{out_path, io_mode::create};
 
+  // CF global attributes
+  out_file.att_set("Conventions", "CF-1.10");
+  out_file.att_set("title", "Radar volume gridded to Cartesian coordinates");
+  out_file.att_set("institution", "Bureau of Meteorology");
+  out_file.att_set("source", source);
+  out_file.att_set("history", "Created by vargrid 0.1.0");
+  out_file.att_set("date", date_str);
+  out_file.att_set("time", time_str);
+  out_file.att_set("lowest_sweep_time", lowest_sweep_time);
+  out_file.att_set("date_created", to_string(bom::timestamp::now()));
+  out_file.att_set("projection", proj4_string);
+  out_file.att_set("gridding_method", method);
+
+  // Dimensions
   auto& dim_x = io::cf::create_spatial_dimension(out_file, "x", "projection_x_coordinate", coords.col_units(), coords.col_edges());
   auto& dim_y = io::cf::create_spatial_dimension(out_file, "y", "projection_y_coordinate", coords.row_units(), y);
-  auto& dim_e = out_file.create_dimension("elevation", dset.elevation.size());
+  auto& dim_e = out_file.create_dimension("elevation", elevation.size());
   auto& dim_a = out_file.create_dimension("z", altitudes.size());
   auto& dim_nrad = out_file.create_dimension("nradar", 1);
 
+  // Coordinate variables
   auto& var_e = out_file.create_variable("elevation", io::nc::data_type::f64, {&dim_e});
   auto& var_a = out_file.create_variable("z", io::nc::data_type::f64, {&dim_a});
   auto& var_lon = out_file.create_variable("longitude", io::nc::data_type::f32, {&dim_y, &dim_x}, {dim_y.size(), dim_x.size()});
@@ -281,40 +437,48 @@ auto run_gridding(
   auto& var_ralt = out_file.create_variable("radar_altitude", io::nc::data_type::f64, {&dim_nrad});
   io::cf::create_grid_mapping(out_file, "proj", proj4_string, "", "m", "m");
 
-  auto& var_data = out_file.create_variable(moment_name, io::nc::data_type::f32,
-    {&dim_a, &dim_y, &dim_x}, {1, dim_y.size(), dim_x.size()});
-
-  var_e.write(dset.elevation);
-  var_a.write(altitudes);
-  var_lon.write(lon);
-  var_lat.write(lat);
-  var_nyq.write(dset.nyquist);
-  var_rlat.write(radar_lat);
-  var_rlon.write(radar_lon);
-  var_ralt.write(radar_alt);
-
   set_nc_var_attrs(var_a, "altitude");
+  var_a.att_set("positive", "up");
   set_nc_var_attrs(var_lon, "longitude");
   set_nc_var_attrs(var_lat, "latitude");
   set_nc_var_attrs(var_nyq, "nyquist");
   set_nc_var_attrs(var_rlat, "radar_latitude");
   set_nc_var_attrs(var_rlon, "radar_longitude");
   set_nc_var_attrs(var_ralt, "radar_altitude");
-  if (moment_name == "DBZH" || moment_name == "DBZH_CLEAN")
-    set_nc_var_attrs(var_data, "reflectivity");
-  var_data.att_set("_FillValue", nodata);
 
-  out_file.att_set("source", dset.source);
-  out_file.att_set("date", dset.date);
-  out_file.att_set("time", dset.time);
-  out_file.att_set("lowest_sweep_time", dset.lowest_sweep_time);
-  out_file.att_set("date_created", to_string(bom::timestamp::now()));
-  out_file.att_set("projection", proj4_string);
-  out_file.att_set("gridding_method", method);
+  var_e.write(elevation);
+  var_a.write(altitudes);
+  var_lon.write(lon);
+  var_lat.write(lat);
+  var_nyq.write(nyquist);
+  var_rlat.write(radar_lat);
+  var_rlon.write(radar_lon);
+  var_ralt.write(radar_alt);
 
-  // Process each altitude layer
+  // Create data variables for each field
+  std::map<std::string, io::nc::variable*> data_vars;
+  std::map<std::string, io::nc::variable*> nobs_vars;
+  for (auto& field : selected_fields) {
+    auto& var = out_file.create_variable(field, io::nc::data_type::f32,
+      {&dim_a, &dim_y, &dim_x}, {1, dim_y.size(), dim_x.size()});
+    set_cf_attributes(var, field);
+    data_vars[field] = &var;
+
+    if (output_obs_count) {
+      auto nobs_name = "nobs_" + field;
+      auto& nvar = out_file.create_variable(nobs_name, io::nc::data_type::f32,
+        {&dim_a, &dim_y, &dim_x}, {1, dim_y.size(), dim_x.size()});
+      nvar.att_set("long_name", "Observation count for " + field);
+      nvar.att_set("units", "1");
+      nvar.att_set("_FillValue", nodata);
+      nobs_vars[field] = &nvar;
+    }
+  }
+
+  // --- Grid all fields at all layers ---
   {
-    phase_timer t("Gridding " + std::to_string(altitudes.size()) + " layers");
+    phase_timer t("Gridding " + std::to_string(selected_fields.size()) +
+                  " field(s) x " + std::to_string(altitudes.size()) + " layers");
 
     auto num_workers = std::min(
         static_cast<size_t>(std::thread::hardware_concurrency()),
@@ -331,23 +495,35 @@ auto run_gridding(
         if (i >= altitudes.size())
           break;
 
-        array2f gridded;
-        if (method == "variational") {
-          auto H = build_observation_operator(
-            vol, gp, x0, y0, dx, dy,
-            grid_nx, grid_ny, altitudes[i], vcfg);
-          gridded = variational_grid(H, vcfg);
-        } else {
-          gridded = generate_cappi(
-            vol, latlons, config["max_alt_dist"],
-            config["idw_pwr"], altitudes[i]);
+        for (auto& field : selected_fields) {
+          auto& vol = volumes.at(field);
+          array2f gridded;
+
+          if (method == "variational") {
+            auto H = build_observation_operator(
+              vol, gp, x0, y0, dx, dy,
+              grid_nx, grid_ny, altitudes[i], vcfg);
+            gridded = variational_grid(H, vcfg);
+
+            if (output_obs_count) {
+              auto nobs = observation_density(H);
+              if (config["origin"].string() == "xy")
+                flipud(nobs);
+              auto lock = std::lock_guard<std::mutex>{mut_netcdf};
+              nobs_vars.at(field)->write(nobs, {i});
+            }
+          } else {
+            gridded = generate_cappi(
+              vol, latlons, config["max_alt_dist"],
+              config["idw_pwr"], altitudes[i]);
+          }
+
+          if (config["origin"].string() == "xy")
+            flipud(gridded);
+
+          auto lock = std::lock_guard<std::mutex>{mut_netcdf};
+          data_vars.at(field)->write(gridded, {i});
         }
-
-        if (config["origin"].string().compare("xy") == 0)
-          flipud(gridded);
-
-        auto lock = std::lock_guard<std::mutex>{mut_netcdf};
-        var_data.write(gridded, {i});
       }
     };
 
