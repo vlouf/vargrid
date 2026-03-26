@@ -6,115 +6,79 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
 include(GNUInstallDirs)
 
-# --- Find BOM libraries ---
-# These are expected at CMAKE_INSTALL_PREFIX (e.g. /opt/bom).
-# Pass -DCMAKE_INSTALL_PREFIX=/opt/bom when invoking cmake.
-find_package(PkgConfig)
+# --- Dependencies ---
+
+find_package(PkgConfig REQUIRED)
+find_package(Threads REQUIRED)
+
+# BOM libraries
 find_package(bom-util REQUIRED)
-list(APPEND DEPENDENCY_LIBRARIES bom-util::bom-util)
-
 find_package(bom-core REQUIRED)
-list(APPEND DEPENDENCY_LIBRARIES bom-core::bom-core)
 
-# fails link on el8 without this
-find_package(Threads)
-list(APPEND DEPENDENCY_LIBRARIES Threads::Threads)
-# --- System dependencies ---
-
+# HDF5 (try config first, then module)
 find_package(hdf5 COMPONENTS C HL CONFIG)
-if (hdf5_FOUND)  
-  list(APPEND DEPENDENCY_INCLUDES_PRIVATE ${HDF5_INCLUDE_DIRS})
-  list(APPEND DEPENDENCY_LIBRARIES hdf5-shared)
-  message("Found HDF5 via hdf5-config.cmake")
+if (hdf5_FOUND)
+  list(APPEND DEP_LIBS hdf5-shared)
+  message(STATUS "Found HDF5 via hdf5-config.cmake")
 else()
   find_package(HDF5 MODULE COMPONENTS C HL)
-  if (HDF5_FOUND)    
-    list(APPEND DEPENDENCY_INCLUDES_PRIVATE ${HDF5_INCLUDE_DIRS})
-    list(APPEND DEPENDENCY_LIBRARIES ${HDF5_LIBRARIES})
-    message("Found HDF5 via FindHDF5.cmake module")  
+  if (HDF5_FOUND)
+    list(APPEND DEP_INCLUDES ${HDF5_INCLUDE_DIRS})
+    list(APPEND DEP_LIBS ${HDF5_LIBRARIES})
+    message(STATUS "Found HDF5 via FindHDF5.cmake")
   endif()
 endif()
 
+# NetCDF (try config first, then pkg-config)
 find_package(netCDF CONFIG)
-if(netCDF_FOUND)  
-  list(APPEND DEPENDENCY_INCLUDES_PRIVATE ${netCDF_INCLUDE_DIRS})
-  list(APPEND DEPENDENCY_LIBRARIES netCDF::netcdf)
-  message("Found netCDF via netCDFConfig.cmake")
+if (netCDF_FOUND)
+  list(APPEND DEP_LIBS netCDF::netcdf)
+  message(STATUS "Found netCDF via netCDFConfig.cmake")
 else()
   pkg_check_modules(netCDF netcdf)
-  if(netCDF_FOUND)    
-    list(APPEND DEPENDENCY_INCLUDES_PRIVATE ${netCDF_INCLUDE_DIRS})
-    list(APPEND DEPENDENCY_LIBRARIES ${netCDF_LIBRARIES})
-    message("Found netcdf via pkg-config")  
+  if (netCDF_FOUND)
+    list(APPEND DEP_INCLUDES ${netCDF_INCLUDE_DIRS})
+    list(APPEND DEP_LIBS ${netCDF_LIBRARIES})
+    message(STATUS "Found netCDF via pkg-config")
   endif()
 endif()
 
 pkg_check_modules(PROJ REQUIRED IMPORTED_TARGET proj)
 pkg_check_modules(UDUNITS2 QUIET udunits2)
 
-# --- Source files ---
-# Expected directory layout:
-#
-#   vargrid/
-#   ├── CMakeLists.txt          (this file)
-#   └── src/
-#       ├── pch.h               (from layered-flow)
-#       ├── array_operations.h  (from layered-flow)
-#       ├── array_operations.cc (from layered-flow)
-#       ├── cappi.h             (from layered-flow)
-#       ├── cappi.cc            (from layered-flow)
-#       ├── io.h                (from layered-flow)
-#       ├── io.cc               (from layered-flow)
-#       ├── metadata.h          (from layered-flow)
-#       ├── metadata.cc         (from layered-flow)
-#       └── vargrid/
-#           ├── main.cc
-#           ├── config.h
-#           ├── cost_function.h
-#           ├── observation_operator.h
-#           ├── observation_operator.cc
-#           ├── solver.h
-#           ├── vargrid.h
-#           └── vargrid.cc
+# --- Sources ---
 
-set(LAYERED_FLOW_SOURCES
-  src/io.cc
-  src/cappi.cc
-  src/metadata.cc
-  src/array_operations.cc
-)
-
-set(VARGRID_SOURCES
-  src/vargrid/main.cc
-  src/vargrid/observation_operator.cc
-  src/vargrid/vargrid.cc
+set(SOURCES
+  src/main.cc
+  src/reader.cc
+  src/writer.cc
+  src/grid.cc
+  src/gridding/cappi.cc
+  src/gridding/observation_operator.cc
+  src/gridding/variational.cc
 )
 
 # --- Executable ---
-add_executable(vargrid
-  ${LAYERED_FLOW_SOURCES}
-  ${VARGRID_SOURCES}
-)
+
+add_executable(vargrid ${SOURCES})
 
 target_include_directories(vargrid PRIVATE
-  ${BOM_INCLUDE_DIR}
   ${CMAKE_CURRENT_SOURCE_DIR}/src
-  ${CMAKE_CURRENT_SOURCE_DIR}/src/vargrid
+  ${DEP_INCLUDES}
 )
 
 target_link_libraries(vargrid PRIVATE
-  ${BOM_CORE_LIB}
-  ${BOM_UTIL_LIB}
-  ${DEPENDENCY_LIBRARIES}
+  bom-util::bom-util
+  bom-core::bom-core
+  ${DEP_LIBS}
   PkgConfig::PROJ
+  Threads::Threads
 )
 
-if(UDUNITS2_FOUND)
+if (UDUNITS2_FOUND)
   target_link_libraries(vargrid PRIVATE PkgConfig::UDUNITS2)
 endif()
 
-find_package(Threads REQUIRED)
-target_link_libraries(vargrid PRIVATE Threads::Threads)
-
 # --- Install ---
-install(TARGETS vargrid RUNTIME DESTINATION bin)
+
+install(TARGETS vargrid RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR})
