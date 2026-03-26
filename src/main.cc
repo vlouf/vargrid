@@ -73,6 +73,13 @@ vargrid_ref_range 10000
 vargrid_min_weight 0.01
 vargrid_use_nearest_init true
 
+# Perona-Malik edge threshold (in data units, e.g. dBZ).
+# Gradients larger than kappa are preserved (storm edges),
+# gradients smaller than kappa are smoothed.
+# Set to 0 to disable edge-preservation (isotropic Laplacian).
+# Typical: 5-15 dBZ for reflectivity, 2-5 m/s for velocity.
+vargrid_kappa 10.0
+
 )";
 
 constexpr auto try_again = "try --help for usage instructions\n";
@@ -152,6 +159,7 @@ static auto parse_vargrid_config(io::configuration const& config, float beamwidt
   cfg.ref_range = std::stof(config.optional("vargrid_ref_range", "10000"));
   cfg.min_weight = std::stof(config.optional("vargrid_min_weight", "0.01"));
   cfg.use_nearest_init = config.optional("vargrid_use_nearest_init", "true") == "true";
+  cfg.kappa = std::stof(config.optional("vargrid_kappa", "10.0"));
   cfg.beamwidth = beamwidth;
   return cfg;
 }

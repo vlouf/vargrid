@@ -21,6 +21,10 @@ struct observation_operator {
   size_t grid_ny;
   std::vector<int> obs_count;
 
+  // Perona-Malik edge threshold. When > 0, edge-preserving smoothness
+  // is used. When <= 0, falls back to isotropic Laplacian.
+  float kappa = 0.0f;
+
   auto grid_size() const -> size_t { return grid_nx * grid_ny; }
 };
 

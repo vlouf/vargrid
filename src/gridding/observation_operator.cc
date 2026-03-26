@@ -42,25 +42,30 @@ auto precompute_gate_projections(
     gp.sweeps[iscan].nrays = nrays;
     gp.sweeps[iscan].nbins = nbins;
 
-    std::vector<double> lons(nrays * nbins);
-    std::vector<double> lats(nrays * nbins);
+    constexpr double deg2rad = M_PI / 180.0;
+
+    std::vector<vec2d> xy(nrays * nbins);
 
     for (size_t iray = 0; iray < nrays; ++iray) {
       for (size_t ibin = 0; ibin < nbins; ++ibin) {
         auto gate_ll = wgs84.bearing_range_to_latlon(
           radarloc, scan.rays[iray], scan.bins[ibin].ground_range);
         size_t idx = iray * nbins + ibin;
-        lons[idx] = gate_ll.lon.degrees();
-        lats[idx] = gate_ll.lat.degrees();
+        xy[idx] = vec2d{gate_ll.lon.degrees() * deg2rad, gate_ll.lat.degrees() * deg2rad};
       }
     }
 
-    auto sx = span<double>{lons.data(), lons.size()};
-    auto sy = span<double>{lats.data(), lats.size()};
-    map_projection::transform(geo, proj, sx, sy);
+    // Batch transform: geographic (radians) -> projected CRS
+    auto xy_span = span<vec2d>{xy.data(), static_cast<ptrdiff_t>(xy.size())};
+    map_projection::transform(geo, proj, xy_span);
 
-    gp.sweeps[iscan].px = std::move(lons);
-    gp.sweeps[iscan].py = std::move(lats);
+    // Extract projected coordinates
+    gp.sweeps[iscan].px.resize(nrays * nbins);
+    gp.sweeps[iscan].py.resize(nrays * nbins);
+    for (size_t i = 0; i < xy.size(); ++i) {
+      gp.sweeps[iscan].px[i] = xy[i].x;
+      gp.sweeps[iscan].py[i] = xy[i].y;
+    }
   }
 
   return gp;
@@ -80,6 +85,7 @@ auto build_observation_operator(
   H.grid_nx = grid_nx;
   H.grid_ny = grid_ny;
   H.obs_count.resize(grid_nx * grid_ny, 0);
+  H.kappa = cfg.kappa;
 
   size_t topscan = 0;
   for (size_t iscan = 1; iscan < vol.sweeps.size(); iscan++) {

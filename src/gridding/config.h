@@ -22,6 +22,13 @@ struct vargrid_config {
   float min_weight = 0.01f;      // Floor to prevent zero weights
   float beamwidth = 1.0f;        // Radar beamwidth in degrees
 
+  // Perona-Malik edge-preserving smoothness.
+  // kappa is the edge threshold in data units (e.g. dBZ for reflectivity).
+  // Gradients >> kappa are preserved (storm edges), gradients << kappa are smoothed.
+  // Set to 0 to disable (falls back to isotropic Laplacian).
+  // Typical values: 5-15 dBZ for reflectivity, 2-5 m/s for velocity.
+  float kappa = 10.0f;
+
   // Initial guess strategy
   bool use_nearest_init = true;
 
