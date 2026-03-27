@@ -9,13 +9,10 @@
 namespace bom { class angle; struct latlon; struct latlonalt; template<typename T> class array2; }
 
 // A single observation contribution to one grid cell.
-// With bilinear interpolation, a single radar gate produces up to 4 observations
-// (one per surrounding grid cell), each with a bilinear weight multiplied into
-// the observation weight.
 struct observation {
   size_t grid_index;
   float value;
-  float weight;      // observation quality weight × bilinear interpolation weight
+  float weight;
   float alt_dist;
 };
 
@@ -28,18 +25,21 @@ struct observation_operator {
 
   float kappa = 0.0f;
 
+  // Per-cell azimuth from radar (degrees, [0,360)) — used for Wx/Wy weights.
+  std::vector<float> cell_azimuth_deg;
+
+  // Per-cell distance to nearest observation (in grid cells) — used for JB.
+  // 0 = cell has observations, large = far from data.
+  std::vector<float> dist_to_obs;
+
   auto grid_size() const -> size_t { return grid_nx * grid_ny; }
 };
 
 // Precomputed bearing/range lookup for mapping gates to grid cells.
-// Stores both a binned lookup table (for O(1) nearest-cell finding)
-// and the per-cell bearing/range values (for bilinear weight computation).
 struct grid_bearings {
-  // Per-cell bearing (degrees, [0,360)) and ground range (m)
   std::vector<float> cell_bearing_deg;  // [ny * nx]
   std::vector<float> cell_range;        // [ny * nx]
 
-  // Binned lookup: bin_to_grid[bearing_bin * n_range_bins + range_bin] = grid index
   std::vector<size_t> bin_to_grid;
 
   size_t n_bearing_bins;

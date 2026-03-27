@@ -20,40 +20,28 @@ static void compute_initial_guess(float* x, const observation_operator& H, float
   }
 }
 
-static void mask_unconstrained(float* x, const observation_operator& H)
+// Mask cells that are very far from any observation as nodata.
+// The background constraint JB handles smoothly decaying toward background
+// in data voids, but cells beyond a large distance should be NaN in output.
+// We use the precomputed dist_to_obs from the observation operator.
+static void mask_distant_cells(float* x, const observation_operator& H, float max_dist_cells)
 {
   size_t n = H.grid_size();
-  size_t nx = H.grid_nx;
-  size_t ny = H.grid_ny;
 
-  constexpr int propagation_steps = 3;
-  std::vector<bool> has_data(n, false);
+  if (H.dist_to_obs.empty()) return;
 
-  for (size_t i = 0; i < n; ++i)
-    has_data[i] = (H.obs_count[i] > 0);
-
-  std::vector<bool> next(n, false);
-  for (int step = 0; step < propagation_steps; ++step) {
-    for (size_t j = 0; j < ny; ++j) {
-      for (size_t i = 0; i < nx; ++i) {
-        size_t idx = j * nx + i;
-        if (has_data[idx]) { next[idx] = true; continue; }
-        bool nb = false;
-        if (i > 0      && has_data[idx - 1])  nb = true;
-        if (i < nx - 1 && has_data[idx + 1])  nb = true;
-        if (j > 0      && has_data[idx - nx]) nb = true;
-        if (j < ny - 1 && has_data[idx + nx]) nb = true;
-        next[idx] = nb;
-      }
-    }
-    std::swap(has_data, next);
+  for (size_t i = 0; i < n; ++i) {
+    if (H.dist_to_obs[i] > max_dist_cells)
+      x[i] = nodata;
   }
-
-  for (size_t i = 0; i < n; ++i)
-    if (!has_data[i]) x[i] = nodata;
 }
 
-auto variational_grid(const observation_operator& H, const vargrid_config& cfg) -> array2f
+auto variational_grid(
+      const observation_operator& H
+    , const vargrid_config& cfg
+    , size_t total_tasks
+    , std::atomic<size_t>& completed_tasks
+    ) -> array2f
 {
   size_t nx = H.grid_nx;
   size_t ny = H.grid_ny;
@@ -69,13 +57,21 @@ auto variational_grid(const observation_operator& H, const vargrid_config& cfg) 
 
   if (!H.obs.empty()) {
     auto sr = solve_cg(result.data(), H, cfg);
-    trace::log("  Variational grid: {} iter, cost={:.4f}, residual={:.2e}, converged={}",
-      sr.iterations, sr.final_cost, sr.final_residual, sr.converged ? "yes" : "no");
+
+    auto done = completed_tasks.fetch_add(1) + 1;
+    int pct = static_cast<int>(100.0 * done / total_tasks);
+    trace::log("  [{:3d}%] Variational: {} iter, cost={:.1f}, residual={:.2e}, {}",
+      pct, sr.iterations, sr.final_cost, sr.final_residual,
+      sr.converged ? "converged" : "not converged");
   } else {
+    completed_tasks.fetch_add(1);
     trace::warning("  Variational grid: no observations for this layer");
   }
 
-  mask_unconstrained(result.data(), H);
+  // Mask cells far from observations as nodata.
+  // Use 2× the background cutoff as the mask threshold — cells beyond this
+  // are fully dominated by the background constraint anyway.
+  mask_distant_cells(result.data(), H, 2.0f * cfg.bg_cutoff_cells);
   return result;
 }
 

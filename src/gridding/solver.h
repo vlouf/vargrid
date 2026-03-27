@@ -45,7 +45,7 @@ inline auto solve_cg(
   std::vector<float> work(2 * n);  // scratch buffer for cost function (needs 2*n for second-order)
 
   // Evaluate initial gradient
-  float cost = evaluate_gradient(x, grad.data(), H, cfg.lambda_h, work.data());
+  float cost = evaluate_gradient(x, grad.data(), H, cfg, work.data());
 
   // Initial search direction = -gradient (steepest descent)
   float grad_norm_sq = 0.0f;
@@ -87,7 +87,7 @@ inline auto solve_cg(
       for (size_t i = 0; i < n; ++i)
         x_trial[i] = x[i] + step * direction[i];
 
-      new_cost = evaluate_gradient(x_trial.data(), grad.data(), H, cfg.lambda_h, work.data());
+      new_cost = evaluate_gradient(x_trial.data(), grad.data(), H, cfg, work.data());
 
       if (new_cost <= cost + c1 * step * dir_dot_grad)
         break;

@@ -211,6 +211,9 @@ auto build_observation_operator(
   H.obs_count.resize(grid_nx * grid_ny, 0);
   H.kappa = cfg.kappa;
 
+  // Copy per-cell azimuth for Wx/Wy weights
+  H.cell_azimuth_deg = gb.cell_bearing_deg;
+
   size_t topscan = 0;
   for (size_t iscan = 1; iscan < vol.sweeps.size(); iscan++) {
     if (vol.sweeps[iscan].beam.elevation() > vol.sweeps[topscan].beam.elevation())
@@ -254,6 +257,44 @@ auto build_observation_operator(
 
   trace::debug("  Observation operator: {} gates -> {} obs entries, {} out of bounds, alt={:.0f}m",
     total_obs, H.obs.size(), out_of_bounds, altitude);
+
+  // Compute distance to nearest observation for each cell (BFS in grid cells).
+  // Used by the background constraint JB (Brook et al. 2022 Eq. 4).
+  {
+    size_t n = grid_nx * grid_ny;
+    H.dist_to_obs.assign(n, std::numeric_limits<float>::max());
+    std::vector<size_t> frontier;
+
+    for (size_t i = 0; i < n; ++i) {
+      if (H.obs_count[i] > 0) {
+        H.dist_to_obs[i] = 0.0f;
+        frontier.push_back(i);
+      }
+    }
+
+    // BFS: propagate distance in grid-cell units
+    float current_dist = 0.0f;
+    while (!frontier.empty()) {
+      current_dist += 1.0f;
+      std::vector<size_t> next_frontier;
+      for (auto idx : frontier) {
+        size_t iy = idx / grid_nx;
+        size_t ix = idx % grid_nx;
+        auto try_cell = [&](size_t cx, size_t cy) {
+          size_t cidx = cy * grid_nx + cx;
+          if (H.dist_to_obs[cidx] > current_dist) {
+            H.dist_to_obs[cidx] = current_dist;
+            next_frontier.push_back(cidx);
+          }
+        };
+        if (ix > 0)            try_cell(ix - 1, iy);
+        if (ix < grid_nx - 1)  try_cell(ix + 1, iy);
+        if (iy > 0)            try_cell(ix, iy - 1);
+        if (iy < grid_ny - 1)  try_cell(ix, iy + 1);
+      }
+      frontier = std::move(next_frontier);
+    }
+  }
 
   return H;
 }

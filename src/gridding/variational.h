@@ -5,6 +5,7 @@
 #include "observation_operator.h"
 #include "solver.h"
 #include "../types.h"
+#include <atomic>
 
 // Precompute bearing and range from radar to each grid cell (main thread).
 auto precompute_grid_bearings(
@@ -24,9 +25,12 @@ auto build_observation_operator(
     ) -> observation_operator;
 
 // Variational gridding from a precomputed observation operator.
+// total_tasks and completed_tasks are for progress logging.
 auto variational_grid(
       const observation_operator& H
     , const vargrid_config& cfg
+    , size_t total_tasks
+    , std::atomic<size_t>& completed_tasks
     ) -> array2f;
 
 // Observation count per grid cell (diagnostic).

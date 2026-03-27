@@ -102,6 +102,20 @@ vargrid_use_nearest_init true
 # Typical: 5-15 dBZ for reflectivity, 2-5 m/s for velocity.
 vargrid_kappa 0
 
+# Azimuthal weights (Brook et al. 2022 Eq. 3).
+# Smoothing is stronger along azimuths (coarser spacing) than range.
+# range_spacing = radar range gate spacing in meters.
+# Set to 0 to disable azimuthal weighting.
+vargrid_range_spacing 250
+
+# Background constraint (Brook et al. 2022 Eq. 4).
+# Penalises deviations from background (zero) in data voids.
+# lambda_b: weight of the background constraint (0 = disabled)
+# bg_cutoff_cells: cutoff radius in grid cells — controls how far from
+#   observations the constraint activates. Smaller = tighter constraint.
+vargrid_lambda_b 1.0
+vargrid_bg_cutoff_cells 5.0
+
 )";
 
 constexpr auto try_again = "try --help for usage instructions\n";
@@ -182,6 +196,9 @@ static auto parse_vargrid_config(io::configuration const& config, float beamwidt
   cfg.min_weight     = std::stof(config.optional("vargrid_min_weight", "0.01"));
   cfg.use_nearest_init = std::string(config.optional("vargrid_use_nearest_init", "true")) != "false";
   cfg.kappa          = std::stof(config.optional("vargrid_kappa", "0"));
+  cfg.range_spacing  = std::stof(config.optional("vargrid_range_spacing", "250"));
+  cfg.lambda_b       = std::stof(config.optional("vargrid_lambda_b", "1.0"));
+  cfg.bg_cutoff_cells = std::stof(config.optional("vargrid_bg_cutoff_cells", "5.0"));
   cfg.beamwidth      = beamwidth;
   return cfg;
 }
@@ -298,6 +315,8 @@ static auto run_gridding(
     if (num_workers == 0) num_workers = 4;
 
     std::atomic<size_t> next_layer{0};
+    std::atomic<size_t> completed_tasks{0};
+    size_t total_tasks = altitudes.size() * selected_fields.size();
     std::mutex mut_netcdf;
 
     auto worker = [&]() {
@@ -312,7 +331,7 @@ static auto run_gridding(
           if (method == "variational") {
             auto H = build_observation_operator(
               vol, gb, grid_nx, grid_ny, altitudes[i], grid_spacing, vcfg);
-            gridded = variational_grid(H, vcfg);
+            gridded = variational_grid(H, vcfg, total_tasks, completed_tasks);
 
             if (output_obs_count) {
               auto nobs = observation_density(H);

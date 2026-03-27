@@ -8,64 +8,30 @@
 
 // Cost function following Brook et al. (2022):
 //
-//   J(φ) = ||d - Rφ||² + λH (||φ_xx||² + ||φ_yy||²)
+//   J(φ) = Jo + λH·Js + λB·JB
 //
-// where R is the bilinear interpolation operator (encoded in H.obs),
-// φ_xx and φ_yy are second-order centered finite differences with
-// Neumann boundary conditions, and λH is the horizontal smoothing weight.
+//   Jo = sum_i w_i (Rφ - d_i)²                            (data fidelity)
+//   Js = ||Wy·φ_yy||² + ||Wx·φ_xx||²                     (smoothness, Eq. 2)
+//   JB = ||exp(-rc²/r²) · φ||²                            (background, Eq. 4)
 //
-// Optionally, Perona-Malik edge-preserving diffusion can be applied
-// to the first-order terms instead (when kappa > 0).
+// Azimuthal weights (Eq. 3):
+//   Wx(φ) = C - A·cos(2φ),   Wy(φ) = C + A·cos(2φ)
+//   where A = |f-1|/2, C = (f+1)/2, f = Δr/Δϕ
 
-// Apply the isotropic Laplacian (first-order graph Laplacian).
-// Kept for backward compatibility and unit tests.
-inline void apply_laplacian(
-    const float* x,
-    float* Lx,
-    size_t nx,
-    size_t ny)
-{
-  for (size_t j = 0; j < ny; ++j) {
-    for (size_t i = 0; i < nx; ++i) {
-      size_t idx = j * nx + i;
-      float center = x[idx];
-      float sum = 0.0f;
-      if (i > 0)      sum += center - x[idx - 1];
-      if (i < nx - 1) sum += center - x[idx + 1];
-      if (j > 0)      sum += center - x[idx - nx];
-      if (j < ny - 1) sum += center - x[idx + nx];
-      Lx[idx] = sum;
-    }
-  }
-}
-
-// Second-order smoothness: ||φ_xx||² + ||φ_yy||²
-// Uses centered second derivatives with Neumann BCs.
-//
-// φ_xx[j][i] = φ[j][i-1] - 2φ[j][i] + φ[j][i+1]
-// At boundaries: Neumann => φ[-1] = φ[0], so φ_xx = -φ[0] + φ[1] at i=0
-//
-// Cost:  Js = sum (φ_xx)² + sum (φ_yy)²
-// Gradient: ∇Js = 2 * (Dxx^T Dxx + Dyy^T Dyy) φ
-//         = 2 * (L4x + L4y) φ  where L4 is the biharmonic-like operator
-//
-// For efficiency, we compute the second derivatives, then the cost and
-// gradient in a single pass using the adjoint relationship.
-
-// Compute second derivative in x: φ_xx
+// Compute second derivative in x: φ_xx (centered, Neumann BC)
 inline void compute_dxx(const float* x, float* dxx, size_t nx, size_t ny)
 {
   for (size_t j = 0; j < ny; ++j) {
     for (size_t i = 0; i < nx; ++i) {
       size_t idx = j * nx + i;
-      float left   = (i > 0)      ? x[idx - 1] : x[idx];  // Neumann BC
-      float right  = (i < nx - 1) ? x[idx + 1] : x[idx];  // Neumann BC
+      float left  = (i > 0)      ? x[idx - 1] : x[idx];
+      float right = (i < nx - 1) ? x[idx + 1] : x[idx];
       dxx[idx] = left - 2.0f * x[idx] + right;
     }
   }
 }
 
-// Compute second derivative in y: φ_yy
+// Compute second derivative in y: φ_yy (centered, Neumann BC)
 inline void compute_dyy(const float* x, float* dyy, size_t nx, size_t ny)
 {
   for (size_t j = 0; j < ny; ++j) {
@@ -76,73 +42,6 @@ inline void compute_dyy(const float* x, float* dyy, size_t nx, size_t ny)
       dyy[idx] = up - 2.0f * x[idx] + down;
     }
   }
-}
-
-// Evaluate second-order smoothness cost and gradient.
-// Js = ||φ_xx||² + ||φ_yy||²
-// ∇Js = 2 * (Dxx^T * φ_xx + Dyy^T * φ_yy)
-// The adjoint of Dxx is Dxx itself (symmetric stencil), so:
-// ∇Js[idx] = 2 * (dxx_of_dxx[idx] + dyy_of_dyy[idx])
-// But more efficiently: ∇Js = 2 * Dxx^T(φ_xx) + 2 * Dyy^T(φ_yy)
-// Since Dxx is self-adjoint with Neumann BC, Dxx^T = Dxx.
-inline auto evaluate_second_order_smoothness(
-    const float* x,
-    float* grad_s,     // output gradient of Js
-    float* work1,      // scratch buffer (size nx*ny)
-    float* work2,      // scratch buffer (size nx*ny)
-    size_t nx,
-    size_t ny
-    ) -> float
-{
-  size_t n = nx * ny;
-
-  // Compute φ_xx and φ_yy
-  compute_dxx(x, work1, nx, ny);  // work1 = φ_xx
-  compute_dyy(x, work2, nx, ny);  // work2 = φ_yy
-
-  // Cost = ||φ_xx||² + ||φ_yy||²
-  float Js = 0.0f;
-  for (size_t i = 0; i < n; ++i)
-    Js += work1[i] * work1[i] + work2[i] * work2[i];
-
-  // Gradient = 2 * (Dxx^T φ_xx + Dyy^T φ_yy)
-  // Since Dxx is self-adjoint: Dxx^T(φ_xx) = Dxx(φ_xx) = φ_xxxx ... no.
-  // Actually: ∇_φ ||Dxx φ||² = 2 Dxx^T (Dxx φ)
-  // The adjoint of the centered second difference is itself (it's symmetric).
-  // So: grad_s = 2 * (Dxx(work1) + Dyy(work2))
-  // But that gives fourth-order derivatives. Let's be more careful.
-  //
-  // Actually for a linear operator A:
-  //   ∇_x ||Ax||² = 2 A^T A x
-  // We already have Ax in work1/work2. We need A^T * (Ax).
-  // For the centered second difference with Neumann BC, A^T = A.
-  // So we need Dxx(work1) + Dyy(work2).
-
-  // Compute Dxx^T(φ_xx) = Dxx(φ_xx) and Dyy^T(φ_yy) = Dyy(φ_yy)
-  // We need two more buffers... but we can reuse: compute in-place.
-  // Actually, we can compute the gradient directly by applying Dxx to work1
-  // and Dyy to work2, summing into grad_s.
-
-  // grad_s = 2 * (Dxx(work1) + Dyy(work2))
-  for (size_t j = 0; j < ny; ++j) {
-    for (size_t i = 0; i < nx; ++i) {
-      size_t idx = j * nx + i;
-
-      // Dxx applied to work1 (= φ_xx)
-      float dxx_left  = (i > 0)      ? work1[idx - 1] : work1[idx];
-      float dxx_right = (i < nx - 1) ? work1[idx + 1] : work1[idx];
-      float grad_xx = dxx_left - 2.0f * work1[idx] + dxx_right;
-
-      // Dyy applied to work2 (= φ_yy)
-      float dyy_up   = (j > 0)      ? work2[idx - nx] : work2[idx];
-      float dyy_down = (j < ny - 1) ? work2[idx + nx] : work2[idx];
-      float grad_yy = dyy_up - 2.0f * work2[idx] + dyy_down;
-
-      grad_s[idx] = 2.0f * (grad_xx + grad_yy);
-    }
-  }
-
-  return Js;
 }
 
 // Perona-Malik diffusivity
@@ -196,17 +95,15 @@ inline auto evaluate_pm_smoothness(
 
 // Evaluate the full cost function and gradient.
 //
-// J(φ) = Jo(φ) + λH * Js(φ)
+//   J(φ) = Jo + λH·Js + λB·JB
 //
-// Jo = sum_i w_i * (R*φ[i] - d_i)²   (bilinear R encoded in H.obs)
-// Js = ||φ_xx||² + ||φ_yy||²         (second-order, Brook et al.)
-//   or Perona-Malik (when kappa > 0)
+// work buffer must be at least 2 * nx * ny floats.
 inline auto evaluate_gradient(
     const float* x,
     float* grad,
     const observation_operator& H,
-    float lambda_h,
-    float* work  // temporary buffer, size >= 2 * grid_nx * grid_ny
+    const vargrid_config& cfg,
+    float* work
     ) -> float
 {
   size_t n = H.grid_size();
@@ -216,10 +113,7 @@ inline auto evaluate_gradient(
   for (size_t i = 0; i < n; ++i)
     grad[i] = 0.0f;
 
-  // Observation term: Jo = sum w_i (φ[g_i] - y_i)², ∇Jo[k] = 2 sum w_i (φ[k] - y_i)
-  // With bilinear R, each observation already has the bilinear weight folded
-  // into obs.weight, and obs.grid_index points to one of the 4 cells.
-  // The cost and gradient accumulation is the same as before.
+  // === Jo: observation fidelity ===
   float Jo = 0.0f;
   for (auto& obs : H.obs) {
     float residual = x[obs.grid_index] - obs.value;
@@ -227,29 +121,69 @@ inline auto evaluate_gradient(
     grad[obs.grid_index] += 2.0f * obs.weight * residual;
   }
 
-  // Smoothness term
+  // === Js: smoothness ===
   float Js = 0.0f;
 
   if (H.kappa > 0.0f) {
-    // Perona-Malik first-order edge-preserving
+    // Perona-Malik (no azimuthal weights — they only apply to second-order)
     Js = evaluate_pm_smoothness(x, work, nx, ny, H.kappa);
     for (size_t i = 0; i < n; ++i)
-      grad[i] += lambda_h * work[i];
+      grad[i] += cfg.lambda_h * work[i];
   } else {
-    // Second-order smoothness (Brook et al. 2022)
-    // Js = ||φ_xx||² + ||φ_yy||²
-    // ∇Js = 2 * (Dxx^T Dxx φ + Dyy^T Dyy φ)
-    // Uses work[0..n) for φ_xx and work[n..2n) for φ_yy
+    // Second-order smoothness with azimuthal weights (Brook et al. 2022 Eq. 2-3).
+    //
+    // Js = sum_k [ Wx[k] * φ_xx[k]² + Wy[k] * φ_yy[k]² ]
+    // ∇Js[k] = 2 * Dxx^T(Wx · φ_xx) + 2 * Dyy^T(Wy · φ_yy)
 
     compute_dxx(x, work, nx, ny);          // work[0..n) = φ_xx
     compute_dyy(x, work + n, nx, ny);      // work[n..2n) = φ_yy
 
-    Js = 0.0f;
-    for (size_t i = 0; i < n; ++i)
-      Js += work[i] * work[i] + work[n + i] * work[n + i];
+    // Compute azimuthal weights per cell and apply to second derivatives.
+    // f = range_spacing / (beamwidth_rad * cell_range)
+    // If azimuthal weighting is disabled (range_spacing = 0), Wx = Wy = 1.
+    bool use_azimuthal = (cfg.range_spacing > 0.0f)
+                      && !H.cell_azimuth_deg.empty();
 
-    // Gradient: 2 * (Dxx(φ_xx) + Dyy(φ_yy))
-    // Dxx is self-adjoint with Neumann BC
+    Js = 0.0f;
+    for (size_t i = 0; i < n; ++i) {
+      float Wx = 1.0f, Wy = 1.0f;
+
+      if (use_azimuthal) {
+        float azimuth_rad = H.cell_azimuth_deg[i] * (M_PI / 180.0f);
+        // f = Δr / Δϕ where Δϕ = beamwidth_rad * range
+        // For cells near the radar, clamp range to avoid f->infinity
+        float cell_r = (H.cell_azimuth_deg.size() > i) ? 0.0f : 0.0f;
+        // We don't have cell_range in H, use a representative value.
+        // Actually, we can get it from gb via the grid_bearings, but it's
+        // not stored in H. Use the range_spacing and beamwidth to compute
+        // a global f, or per-cell from stored bearing info.
+        // For simplicity, use a global f based on mid-range of the grid.
+        // TODO: store cell_range in H for per-cell f.
+        float mid_range = 75000.0f;  // approximate mid-range
+        float delta_phi = cfg.beamwidth * (M_PI / 180.0f) * mid_range;
+        float f = cfg.range_spacing / delta_phi;
+        if (f > 1.0f) f = 1.0f;  // clamp: range spacing < azimuthal spacing
+
+        float A = std::fabs(f - 1.0f) / 2.0f;
+        float C = (f + 1.0f) / 2.0f;
+        float cos2phi = std::cos(2.0f * azimuth_rad);
+
+        Wx = C - A * cos2phi;
+        Wy = C + A * cos2phi;
+      }
+
+      // Apply weights to second derivatives
+      float wx_dxx = Wx * work[i];
+      float wy_dyy = Wy * work[n + i];
+
+      Js += wx_dxx * work[i] + wy_dyy * work[n + i];
+
+      // Store weighted derivatives for adjoint pass
+      work[i] = wx_dxx;
+      work[n + i] = wy_dyy;
+    }
+
+    // Gradient: 2 * (Dxx^T(Wx·φ_xx) + Dyy^T(Wy·φ_yy))
     for (size_t j = 0; j < ny; ++j) {
       for (size_t i = 0; i < nx; ++i) {
         size_t idx = j * nx + i;
@@ -262,12 +196,60 @@ inline auto evaluate_gradient(
         float yy_d = (j < ny - 1) ? work[n + idx + nx] : work[n + idx];
         float g_yy = yy_u - 2.0f * work[n + idx] + yy_d;
 
-        grad[idx] += 2.0f * lambda_h * (g_xx + g_yy);
+        grad[idx] += 2.0f * cfg.lambda_h * (g_xx + g_yy);
       }
     }
   }
 
-  return Jo + lambda_h * Js;
+  // === JB: background constraint (Brook et al. 2022 Eq. 4) ===
+  // JB = sum_k [ exp(-2 rc²/r²) * φ[k]² ]
+  // ∇JB[k] = 2 * exp(-2 rc²/r²) * φ[k]
+  // The exponential weighting means: cells near observations (r small) are
+  // barely penalised, while cells far from data (r >> rc) are penalised
+  // strongly toward zero (the background).
+  float JB = 0.0f;
+
+  if (cfg.lambda_b > 0.0f && !H.dist_to_obs.empty()) {
+    float rc = cfg.bg_cutoff_cells;
+    float rc_sq = rc * rc;
+    float bg = std::isnan(cfg.background) ? 0.0f : cfg.background;
+
+    for (size_t i = 0; i < n; ++i) {
+      float r = H.dist_to_obs[i];
+      if (r < 0.5f) continue;  // cell has observations — skip
+
+      float r_sq = r * r;
+      // Brook: exp(-rc²/r²) — large when r >> rc, small when r << rc
+      float w_bg = std::exp(-rc_sq / r_sq);
+
+      float dev = x[i] - bg;
+      JB += w_bg * dev * dev;
+      grad[i] += 2.0f * cfg.lambda_b * w_bg * dev;
+    }
+  }
+
+  return Jo + cfg.lambda_h * Js + cfg.lambda_b * JB;
+}
+
+// Legacy Laplacian — kept for unit tests
+inline void apply_laplacian(
+    const float* x,
+    float* Lx,
+    size_t nx,
+    size_t ny)
+{
+  for (size_t j = 0; j < ny; ++j) {
+    for (size_t i = 0; i < nx; ++i) {
+      size_t idx = j * nx + i;
+      float center = x[idx];
+      float sum = 0.0f;
+      if (i > 0)      sum += center - x[idx - 1];
+      if (i < nx - 1) sum += center - x[idx + 1];
+      if (j > 0)      sum += center - x[idx - nx];
+      if (j < ny - 1) sum += center - x[idx + nx];
+      Lx[idx] = sum;
+    }
+  }
 }
 
 #endif // VARGRID_COST_FUNCTION_H
