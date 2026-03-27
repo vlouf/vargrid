@@ -16,76 +16,91 @@ using namespace bom;
 
 constexpr auto example_config =
 R"(# vargrid configuration
+# =====================
 
-# domain projection
-proj4 "+proj=aea +lat_1=-32.2 +lat_2=-35.2 +lon_0=151.209 +lat_0=-33.7008 +a=6378137 +b=6356752.31414 +units=m"
+# --- Grid geometry (required) ---
 
-# grid size
+# Map projection (PROJ4 string)
+proj4 "+proj=aea +lat_1=-32.2 +lat_2=-35.2 +lon_0=113.997 +lat_0=-22.1032 +a=6378137 +b=6356752.31414 +units=m"
+
+# Grid dimensions (nx ny)
 size "301 301"
 
-# top left coordinates
+# Top-left corner in projected coordinates
 left_top "-150500 150500"
 
-# grid resolution
+# Cell size in projected coordinates (dx dy, negative dy = y increases downward)
 cell_delta "1000 -1000"
 
-# horizontal grid units
+# Coordinate units
 units m
 
-# altitude of lowest layer (m)
-altitude_base 0.0
-
-# altitude step between layers (m)
-altitude_step 500.0
-
-# number of layers
-layer_count 13
-
-# Matrix orientation
+# Matrix orientation: "xy" (geographic, y-axis flipped) or "ij" (matrix)
 origin xy
 
-# gridding method: "cappi" (IDW) or "variational"
+# --- Altitude layers ---
+
+altitude_base 0.0
+altitude_step 500.0
+layer_count 13
+
+# --- Gridding method ---
+
+# "variational" (Brook et al. 2022 inspired) or "cappi" (IDW baseline)
 gridding_method variational
 
-# velocity field name (for undetect handling)
-velocity VRADH
-
-# Field selection (optional):
-#   include_fields "DBZH VRADH ZDR"    - only grid these fields
-#   exclude_fields "SQI CCOR"          - grid everything except these
-# If neither is set, all fields found in the volume are gridded.
+# --- Field selection (optional) ---
+# By default, all fields in the input volume are gridded.
+# include_fields "DBZH VRADH ZDR"    - only grid these fields
+# exclude_fields "SQI CCOR"          - grid everything except these
 # include_fields takes precedence if both are set.
 
-# Output observation count per field (true/false, default false)
-output_obs_count false
+# Velocity field name (controls undetect/nodata handling)
+velocity VRADH
 
-# Pack output data as int16 with scale_factor/add_offset (default true).
-# Reduces file size by ~50% with negligible precision loss.
-# Set to false for full float32 output (e.g. for debugging).
+# --- Output options ---
+
+# Pack data as int16 with CF scale_factor/add_offset (reduces file size ~50%)
 pack_output true
 
-# --- CAPPI parameters (used when gridding_method is "cappi") ---
+# Write observation count diagnostic fields (nobs_FIELD)
+output_obs_count false
+
+# --- CAPPI parameters (gridding_method = cappi) ---
+
 max_alt_dist 20000
 idw_pwr 2.0
 
-# --- Variational gridding parameters ---
-# Horizontal smoothing weight (Brook et al. 2022 second-order formulation)
-# Higher = smoother. Start with 0.01 and adjust.
+# --- Variational parameters (gridding_method = variational) ---
+
+# Smoothing weight: second-order horizontal smoothness (Brook et al. 2022).
+# Controls trade-off between data fidelity and spatial smoothness.
+# Higher = smoother. Typical range: 0.001 - 1.0
 vargrid_lambda_h 0.01
+
+# Maximum altitude difference (m) for gate-to-layer assignment
 vargrid_max_alt_diff 2000
-vargrid_max_iterations 50
+
+# Conjugate gradient solver limits
+vargrid_max_iterations 200
 vargrid_tolerance 1e-5
+
+# Observation error model: beam volume scaling.
+# Weight = (ref_range / slant_range)^beam_power * altitude_weight
+# beam_power=2: inverse-area (pulse volume grows as range^2)
+# ref_range: gates closer than this get weight 1.0 (clamped)
 vargrid_beam_power 2.0
 vargrid_ref_range 10000
 vargrid_min_weight 0.01
+
+# Initial guess: nearest-gate weighted mean (faster convergence)
 vargrid_use_nearest_init true
 
-# Perona-Malik edge threshold (in data units, e.g. dBZ).
-# Gradients larger than kappa are preserved (storm edges),
-# gradients smaller than kappa are smoothed.
-# Set to 0 to disable edge-preservation (isotropic Laplacian).
+# Perona-Malik edge preservation threshold (data units, e.g. dBZ).
+# Gradients >> kappa are preserved, gradients << kappa are smoothed.
+# Set to 0 to use second-order smoothness only (recommended default).
 # Typical: 5-15 dBZ for reflectivity, 2-5 m/s for velocity.
-vargrid_kappa 10.0
+vargrid_kappa 0
 
 )";
 
@@ -158,16 +173,16 @@ static auto select_fields(
 static auto parse_vargrid_config(io::configuration const& config, float beamwidth) -> vargrid_config
 {
   vargrid_config cfg;
-  cfg.lambda_h = std::stof(config.optional("vargrid_lambda_h", "0.01"));
-  cfg.max_alt_diff = std::stof(config.optional("vargrid_max_alt_diff", "2000"));
-  cfg.max_iterations = std::stoi(config.optional("vargrid_max_iterations", "50"));
-  cfg.tolerance = std::stof(config.optional("vargrid_tolerance", "1e-5"));
-  cfg.beam_power = std::stof(config.optional("vargrid_beam_power", "2.0"));
-  cfg.ref_range = std::stof(config.optional("vargrid_ref_range", "10000"));
-  cfg.min_weight = std::stof(config.optional("vargrid_min_weight", "0.01"));
+  cfg.lambda_h       = std::stof(config.optional("vargrid_lambda_h", "0.01"));
+  cfg.max_alt_diff   = std::stof(config.optional("vargrid_max_alt_diff", "2000"));
+  cfg.max_iterations = std::stoi(config.optional("vargrid_max_iterations", "200"));
+  cfg.tolerance      = std::stof(config.optional("vargrid_tolerance", "1e-5"));
+  cfg.beam_power     = std::stof(config.optional("vargrid_beam_power", "2.0"));
+  cfg.ref_range      = std::stof(config.optional("vargrid_ref_range", "10000"));
+  cfg.min_weight     = std::stof(config.optional("vargrid_min_weight", "0.01"));
   cfg.use_nearest_init = std::string(config.optional("vargrid_use_nearest_init", "true")) != "false";
-  cfg.kappa = std::stof(config.optional("vargrid_kappa", "10.0"));
-  cfg.beamwidth = beamwidth;
+  cfg.kappa          = std::stof(config.optional("vargrid_kappa", "0"));
+  cfg.beamwidth      = beamwidth;
   return cfg;
 }
 

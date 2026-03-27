@@ -237,14 +237,10 @@ inline auto evaluate_gradient(
       grad[i] += lambda_h * work[i];
   } else {
     // Second-order smoothness (Brook et al. 2022)
-    float* work2 = work + n;  // second scratch buffer
-    Js = evaluate_second_order_smoothness(x, work, work2, work + 2 * n, nx, ny);
+    // Js = ||φ_xx||² + ||φ_yy||²
+    // ∇Js = 2 * (Dxx^T Dxx φ + Dyy^T Dyy φ)
+    // Uses work[0..n) for φ_xx and work[n..2n) for φ_yy
 
-    // Oops — we need 3 buffers but work is only guaranteed 2*n.
-    // Let me restructure: compute_dxx into work[0..n), compute_dyy into work[n..2n),
-    // then compute the gradient inline.
-
-    // Recompute properly:
     compute_dxx(x, work, nx, ny);          // work[0..n) = φ_xx
     compute_dyy(x, work + n, nx, ny);      // work[n..2n) = φ_yy
 
@@ -252,18 +248,16 @@ inline auto evaluate_gradient(
     for (size_t i = 0; i < n; ++i)
       Js += work[i] * work[i] + work[n + i] * work[n + i];
 
-    // Gradient of ||Dxx φ||² + ||Dyy φ||² = 2(Dxx^T Dxx φ + Dyy^T Dyy φ)
-    // Dxx^T = Dxx (symmetric stencil with Neumann BC)
+    // Gradient: 2 * (Dxx(φ_xx) + Dyy(φ_yy))
+    // Dxx is self-adjoint with Neumann BC
     for (size_t j = 0; j < ny; ++j) {
       for (size_t i = 0; i < nx; ++i) {
         size_t idx = j * nx + i;
 
-        // Dxx applied to φ_xx (= work[0..n))
         float xx_l = (i > 0)      ? work[idx - 1] : work[idx];
         float xx_r = (i < nx - 1) ? work[idx + 1] : work[idx];
         float g_xx = xx_l - 2.0f * work[idx] + xx_r;
 
-        // Dyy applied to φ_yy (= work[n..2n))
         float yy_u = (j > 0)      ? work[n + idx - nx] : work[n + idx];
         float yy_d = (j < ny - 1) ? work[n + idx + nx] : work[n + idx];
         float g_yy = yy_u - 2.0f * work[n + idx] + yy_d;

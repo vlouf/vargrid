@@ -30,7 +30,6 @@ auto precompute_grid_bearings(
   gb.nx = nx;
   gb.ny = ny;
 
-  // Compute bearing and range for every grid cell
   gb.cell_bearing_deg.resize(ny * nx);
   gb.cell_range.resize(ny * nx);
   float max_range = 0;
@@ -87,7 +86,6 @@ auto precompute_grid_bearings(
   return gb;
 }
 
-// Find the nearest grid cell via binned lookup. Returns size_t(-1) if out of range.
 static auto lookup_nearest(
       grid_bearings const& gb
     , float bearing_deg
@@ -112,13 +110,43 @@ static auto lookup_nearest(
   return gb.bin_to_grid[bin_idx];
 }
 
-// Add bilinear observation contributions for a single gate.
-// The gate maps to a fractional position (fy, fx) in the grid.
-// The 4 surrounding cells receive weighted contributions.
-static void add_bilinear_observation(
+// Compute squared physical distance between a gate (bearing_deg, ground_range)
+// and a grid cell, in meters. Uses bearing difference × range as cross-track.
+static inline float gate_cell_dist_sq(
+      float gate_bearing_deg
+    , float gate_range
+    , float cell_bearing_deg
+    , float cell_range
+    )
+{
+  float db = gate_bearing_deg - cell_bearing_deg;
+  if (db > 180.0f) db -= 360.0f;
+  if (db < -180.0f) db += 360.0f;
+
+  // Cross-track distance: bearing difference in radians × average range
+  float avg_range = 0.5f * (gate_range + cell_range);
+  float cross = db * (M_PI / 180.0f) * avg_range;
+
+  // Along-track distance: range difference
+  float along = gate_range - cell_range;
+
+  return cross * cross + along * along;
+}
+
+// Add observation contributions using inverse-distance weighting among
+// the nearest cell and its grid-axis neighbours. This properly spreads
+// each gate's contribution to surrounding cells without making any
+// assumptions about how bearing/range maps to grid x/y axes.
+//
+// We consider the nearest cell and its 4 direct neighbours (up/down/left/right).
+// The gate's contribution is distributed proportionally to 1/d² where d is the
+// physical distance from the gate to each cell.
+static void add_interpolated_observation(
       observation_operator& H
-    , size_t ix0, size_t iy0   // lower-left grid cell
-    , float wx, float wy       // fractional position within cell [0,1]
+    , grid_bearings const& gb
+    , size_t nearest_idx
+    , float gate_bearing_deg
+    , float gate_range
     , float value
     , float obs_weight
     , float alt_dist
@@ -126,32 +154,47 @@ static void add_bilinear_observation(
 {
   size_t nx = H.grid_nx;
   size_t ny = H.grid_ny;
+  size_t iy = nearest_idx / nx;
+  size_t ix = nearest_idx % nx;
 
-  // Bilinear weights for the 4 corners
-  float w00 = (1.0f - wx) * (1.0f - wy);
-  float w10 = wx * (1.0f - wy);
-  float w01 = (1.0f - wx) * wy;
-  float w11 = wx * wy;
+  // Collect the nearest cell and its 4 direct grid neighbours
+  struct candidate { size_t idx; float inv_dist; };
+  candidate candidates[5];
+  int ncand = 0;
 
-  size_t ix1 = std::min(ix0 + 1, nx - 1);
-  size_t iy1 = std::min(iy0 + 1, ny - 1);
-
-  // Each corner gets the observation weighted by the bilinear coefficient
-  auto add = [&](size_t ix, size_t iy, float bw) {
-    if (bw < 1e-6f) return;
-    size_t idx = iy * nx + ix;
-    H.obs.push_back({idx, value, obs_weight * bw, alt_dist});
-    H.obs_count[idx]++;
+  auto add_candidate = [&](size_t cx, size_t cy) {
+    size_t cidx = cy * nx + cx;
+    float d2 = gate_cell_dist_sq(gate_bearing_deg, gate_range,
+                                  gb.cell_bearing_deg[cidx], gb.cell_range[cidx]);
+    // Avoid division by zero: if gate lands exactly on a cell, give it all the weight
+    if (d2 < 1.0f) d2 = 1.0f;
+    candidates[ncand++] = {cidx, 1.0f / d2};
   };
 
-  add(ix0, iy0, w00);
-  add(ix1, iy0, w10);
-  add(ix0, iy1, w01);
-  add(ix1, iy1, w11);
+  // Center
+  add_candidate(ix, iy);
+
+  // 4 direct neighbours (if they exist)
+  if (ix > 0)      add_candidate(ix - 1, iy);
+  if (ix < nx - 1) add_candidate(ix + 1, iy);
+  if (iy > 0)      add_candidate(ix, iy - 1);
+  if (iy < ny - 1) add_candidate(ix, iy + 1);
+
+  // Normalise weights
+  float sum_w = 0.0f;
+  for (int i = 0; i < ncand; ++i)
+    sum_w += candidates[i].inv_dist;
+
+  if (sum_w <= 0.0f) return;
+
+  for (int i = 0; i < ncand; ++i) {
+    float bw = candidates[i].inv_dist / sum_w;
+    if (bw < 1e-6f) continue;
+    H.obs.push_back({candidates[i].idx, value, obs_weight * bw, alt_dist});
+    H.obs_count[candidates[i].idx]++;
+  }
 }
 
-// Build observation operator with bilinear interpolation.
-// Each gate contributes to up to 4 grid cells proportionally.
 auto build_observation_operator(
       volume const& vol
     , grid_bearings const& gb
@@ -179,7 +222,6 @@ auto build_observation_operator(
 
   for (size_t iscan = 0; iscan < vol.sweeps.size(); ++iscan) {
     if (iscan == topscan) continue;
-
     auto& scan = vol.sweeps[iscan];
 
     for (size_t ibin = 0; ibin < scan.bins.size(); ++ibin) {
@@ -192,70 +234,19 @@ auto build_observation_operator(
         if (std::fabs(val - undetect) < 0.1f) continue;
 
         float bearing_deg = scan.rays[iray].degrees();
+        if (bearing_deg < 0) bearing_deg += 360.0f;
         float ground_range = scan.bins[ibin].ground_range;
 
-        // Find nearest grid cell
         auto nearest = lookup_nearest(gb, bearing_deg, ground_range);
         if (nearest == static_cast<size_t>(-1)) {
           out_of_bounds++;
           continue;
         }
 
-        // Convert flat index to (ix, iy)
-        size_t iy_near = nearest / grid_nx;
-        size_t ix_near = nearest % grid_nx;
-
-        // Compute fractional position relative to the nearest cell by
-        // comparing the gate's bearing/range with neighbouring cells.
-        // Find which quadrant the gate is in relative to the nearest cell.
-        float cell_b = gb.cell_bearing_deg[nearest];
-        float cell_r = gb.cell_range[nearest];
-
-        // Bearing difference (handle 0/360 wrap)
-        float db = bearing_deg - cell_b;
-        if (db > 180.0f) db -= 360.0f;
-        if (db < -180.0f) db += 360.0f;
-
-        float dr = ground_range - cell_r;
-
-        // Determine the lower-left cell of the bilinear quad.
-        // If the gate is to the "right" (positive db in grid terms) of the cell,
-        // the cell is the left edge. Otherwise, shift left by 1.
-        // Same logic for range (up/down in the grid).
-        //
-        // The grid y-axis generally increases with range from radar,
-        // and x-axis with bearing. But the exact mapping depends on
-        // the grid orientation. For a regular grid, we approximate:
-        // the bearing direction maps primarily to x, range to y.
-        // Use the grid spacing to convert bearing/range offsets to fractional cells.
-        float bearing_spacing_m = cell_r * cfg.beamwidth * M_PI / 180.0f;
-        if (bearing_spacing_m < grid_spacing) bearing_spacing_m = grid_spacing;
-
-        // Fractional offset in grid cells (approximate)
-        float fx_off = (db * M_PI / 180.0f * cell_r) / grid_spacing;
-        float fy_off = dr / grid_spacing;
-
-        // The fractional grid position
-        float fx = static_cast<float>(ix_near) + fx_off;
-        float fy = static_cast<float>(iy_near) + fy_off;
-
-        // Clamp to grid bounds
-        if (fx < 0.0f) fx = 0.0f;
-        if (fy < 0.0f) fy = 0.0f;
-        if (fx > static_cast<float>(grid_nx - 1)) fx = static_cast<float>(grid_nx - 1);
-        if (fy > static_cast<float>(grid_ny - 1)) fy = static_cast<float>(grid_ny - 1);
-
-        // Integer lower-left and fractional part
-        size_t ix0 = static_cast<size_t>(fx);
-        size_t iy0 = static_cast<size_t>(fy);
-        if (ix0 >= grid_nx - 1) ix0 = grid_nx - 2;
-        if (iy0 >= grid_ny - 1) iy0 = grid_ny - 2;
-        float wx = fx - static_cast<float>(ix0);
-        float wy = fy - static_cast<float>(iy0);
-
         float obs_w = compute_weight(scan.bins[ibin].slant_range, alt_dist, cfg.max_alt_diff, cfg);
 
-        add_bilinear_observation(H, ix0, iy0, wx, wy, val, obs_w, alt_dist);
+        add_interpolated_observation(H, gb, nearest,
+          bearing_deg, ground_range, val, obs_w, alt_dist);
         total_obs++;
       }
     }
