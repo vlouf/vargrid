@@ -20,20 +20,50 @@ static void compute_initial_guess(float* x, const observation_operator& H, float
   }
 }
 
-// Mask cells that are very far from any observation as nodata.
-// The background constraint JB handles smoothly decaying toward background
-// in data voids, but cells beyond a large distance should be NaN in output.
-// We use the precomputed dist_to_obs from the observation operator.
-static void mask_distant_cells(float* x, const observation_operator& H, float max_dist_cells)
+// Mask cells far from any observation using BFS distance.
+// Cells with no observation within mask_distance grid steps are set to NaN.
+static void mask_by_distance(float* x, const observation_operator& H, float max_dist)
 {
   size_t n = H.grid_size();
+  size_t nx = H.grid_nx;
+  size_t ny = H.grid_ny;
 
-  if (H.dist_to_obs.empty()) return;
+  // BFS from cells that have observations
+  std::vector<float> dist(n, std::numeric_limits<float>::max());
+  std::vector<size_t> frontier;
 
   for (size_t i = 0; i < n; ++i) {
-    if (H.dist_to_obs[i] > max_dist_cells)
-      x[i] = nodata;
+    if (H.obs_count[i] > 0) {
+      dist[i] = 0.0f;
+      frontier.push_back(i);
+    }
   }
+
+  float current_dist = 0.0f;
+  while (!frontier.empty() && current_dist < max_dist) {
+    current_dist += 1.0f;
+    std::vector<size_t> next;
+    for (auto idx : frontier) {
+      size_t iy = idx / nx;
+      size_t ix = idx % nx;
+      auto try_cell = [&](size_t cx, size_t cy) {
+        size_t cidx = cy * nx + cx;
+        if (dist[cidx] > current_dist) {
+          dist[cidx] = current_dist;
+          next.push_back(cidx);
+        }
+      };
+      if (ix > 0)       try_cell(ix - 1, iy);
+      if (ix < nx - 1)  try_cell(ix + 1, iy);
+      if (iy > 0)       try_cell(ix, iy - 1);
+      if (iy < ny - 1)  try_cell(ix, iy + 1);
+    }
+    frontier = std::move(next);
+  }
+
+  for (size_t i = 0; i < n; ++i)
+    if (dist[i] > max_dist)
+      x[i] = nodata;
 }
 
 auto variational_grid(
@@ -65,13 +95,9 @@ auto variational_grid(
       sr.converged ? "converged" : "not converged");
   } else {
     completed_tasks.fetch_add(1);
-    trace::warning("  Variational grid: no observations for this layer");
   }
 
-  // Mask cells far from observations as nodata.
-  // Use 2× the background cutoff as the mask threshold — cells beyond this
-  // are fully dominated by the background constraint anyway.
-  mask_distant_cells(result.data(), H, 2.0f * cfg.bg_cutoff_cells);
+  mask_by_distance(result.data(), H, cfg.mask_distance_cells);
   return result;
 }
 

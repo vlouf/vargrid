@@ -21,7 +21,7 @@ R"(# vargrid configuration
 # --- Grid geometry (required) ---
 
 # Map projection (PROJ4 string)
-proj4 "+proj=aea +lat_1=-32.2 +lat_2=-35.2 +lon_0=113.997 +lat_0=-22.1032 +a=6378137 +b=6356752.31414 +units=m"
+proj4 "+proj=aea +lat_1=-32.2 +lat_2=-35.2 +lon_0=151.209 +lat_0=-33.7008 +a=6378137 +b=6356752.31414 +units=m"
 
 # Grid dimensions (nx ny)
 size "301 301"
@@ -108,13 +108,10 @@ vargrid_kappa 0
 # Set to 0 to disable azimuthal weighting.
 vargrid_range_spacing 250
 
-# Background constraint (Brook et al. 2022 Eq. 4).
-# Penalises deviations from background (zero) in data voids.
-# lambda_b: weight of the background constraint (0 = disabled)
-# bg_cutoff_cells: cutoff radius in grid cells — controls how far from
-#   observations the constraint activates. Smaller = tighter constraint.
-vargrid_lambda_b 1.0
-vargrid_bg_cutoff_cells 5.0
+# Mask distance: cells further than this many grid cells from any
+# observation are set to NaN. Controls extrapolation extent.
+# 3 = tight (like CAPPI), 10 = generous fill.
+vargrid_mask_distance 3
 
 )";
 
@@ -197,8 +194,7 @@ static auto parse_vargrid_config(io::configuration const& config, float beamwidt
   cfg.use_nearest_init = std::string(config.optional("vargrid_use_nearest_init", "true")) != "false";
   cfg.kappa          = std::stof(config.optional("vargrid_kappa", "0"));
   cfg.range_spacing  = std::stof(config.optional("vargrid_range_spacing", "250"));
-  cfg.lambda_b       = std::stof(config.optional("vargrid_lambda_b", "1.0"));
-  cfg.bg_cutoff_cells = std::stof(config.optional("vargrid_bg_cutoff_cells", "5.0"));
+  cfg.mask_distance_cells = std::stof(config.optional("vargrid_mask_distance", "3"));
   cfg.beamwidth      = beamwidth;
   return cfg;
 }
