@@ -59,12 +59,19 @@ velocity VRADH
 # Output observation count per field (true/false, default false)
 output_obs_count false
 
+# Pack output data as int16 with scale_factor/add_offset (default true).
+# Reduces file size by ~50% with negligible precision loss.
+# Set to false for full float32 output (e.g. for debugging).
+pack_output true
+
 # --- CAPPI parameters (used when gridding_method is "cappi") ---
 max_alt_dist 20000
 idw_pwr 2.0
 
 # --- Variational gridding parameters ---
-vargrid_alpha 1.0
+# Horizontal smoothing weight (Brook et al. 2022 second-order formulation)
+# Higher = smoother. Start with 0.01 and adjust.
+vargrid_lambda_h 0.01
 vargrid_max_alt_diff 2000
 vargrid_max_iterations 50
 vargrid_tolerance 1e-5
@@ -151,14 +158,14 @@ static auto select_fields(
 static auto parse_vargrid_config(io::configuration const& config, float beamwidth) -> vargrid_config
 {
   vargrid_config cfg;
-  cfg.alpha = std::stof(config.optional("vargrid_alpha", "1.0"));
+  cfg.lambda_h = std::stof(config.optional("vargrid_lambda_h", "0.01"));
   cfg.max_alt_diff = std::stof(config.optional("vargrid_max_alt_diff", "2000"));
   cfg.max_iterations = std::stoi(config.optional("vargrid_max_iterations", "50"));
   cfg.tolerance = std::stof(config.optional("vargrid_tolerance", "1e-5"));
   cfg.beam_power = std::stof(config.optional("vargrid_beam_power", "2.0"));
   cfg.ref_range = std::stof(config.optional("vargrid_ref_range", "10000"));
   cfg.min_weight = std::stof(config.optional("vargrid_min_weight", "0.01"));
-  cfg.use_nearest_init = config.optional("vargrid_use_nearest_init", "true") == "true";
+  cfg.use_nearest_init = std::string(config.optional("vargrid_use_nearest_init", "true")) != "false";
   cfg.kappa = std::stof(config.optional("vargrid_kappa", "10.0"));
   cfg.beamwidth = beamwidth;
   return cfg;
@@ -205,7 +212,7 @@ static auto run_gridding(
 
   // --- Read metadata and volumes ---
   auto meta = read_metadata(vol_odim);
-  auto velocity_field = config.optional("velocity", "VRADH");
+  std::string velocity_field = config.optional("velocity", "VRADH");
 
   std::map<std::string, volume> volumes;
   {
@@ -216,28 +223,25 @@ static auto run_gridding(
     }
   }
 
-  auto method = config.optional("gridding_method", "cappi");
+  std::string method = config.optional("gridding_method", "cappi");
   trace::log("Gridding method: {}", method);
 
   auto vcfg = parse_vargrid_config(config, meta.beamwidth);
-  auto output_obs_count = config.optional("output_obs_count", "false") == "true";
+  auto output_obs_count = std::string(config.optional("output_obs_count", "false")) == "false" ? false : true;
+  auto pack_output = std::string(config.optional("pack_output", "true")) == "false" ? false : true;
 
-  // --- Precompute gate projections (variational only, main thread) ---
-  gate_projections gp;
-  double x0 = 0, y0 = 0, dx = 1, dy = 1;
+  // --- Precompute grid bearings (variational only, main thread) ---
+  grid_bearings gb;
+  float grid_spacing = 1000.0f;  // default, will be computed from config
   if (method == "variational") {
-    phase_timer t("Precomputing gate projections");
-    gp = precompute_gate_projections(volumes.begin()->second, proj4_string);
+    phase_timer t("Precomputing grid bearings");
+    gb = precompute_grid_bearings(volumes.begin()->second.location, latlons);
 
+    // Compute grid spacing from cell_delta config
     auto col_edges = coords.col_edges();
-    auto row_edges = coords.row_edges();
-    x0 = 0.5 * (col_edges[0] + col_edges[1]);
-    y0 = 0.5 * (row_edges[0] + row_edges[1]);
-    double x_last = 0.5 * (col_edges[grid_nx - 1] + col_edges[grid_nx]);
-    double y_last = 0.5 * (row_edges[grid_ny - 1] + row_edges[grid_ny]);
-    dx = (x_last - x0) / (static_cast<double>(grid_nx) - 1.0);
-    dy = (y_last - y0) / (static_cast<double>(grid_ny) - 1.0);
-    trace::debug("Grid origin: ({:.1f}, {:.1f}), spacing: ({:.1f}, {:.1f})", x0, y0, dx, dy);
+    grid_spacing = static_cast<float>(std::fabs(col_edges[1] - col_edges[0]));
+    trace::debug("Grid spacing: {:.0f}m, grid bearings computed for {}x{} cells",
+      grid_spacing, grid_nx, grid_ny);
   }
 
   // --- Prepare output coordinates ---
@@ -265,7 +269,7 @@ static auto run_gridding(
   trace::log("Creating output file: {}", out_path.string());
   auto [out_file, ctx] = create_output_file(
     out_path, coords, y_edges, lon, lat, altitudes, meta,
-    proj4_string, method, selected_fields, output_obs_count,
+    proj4_string, method, selected_fields, output_obs_count, pack_output,
     radar_lat, radar_lon, radar_alt);
 
   // --- Grid all fields at all layers ---
@@ -292,7 +296,7 @@ static auto run_gridding(
 
           if (method == "variational") {
             auto H = build_observation_operator(
-              vol, gp, x0, y0, dx, dy, grid_nx, grid_ny, altitudes[i], vcfg);
+              vol, gb, grid_nx, grid_ny, altitudes[i], grid_spacing, vcfg);
             gridded = variational_grid(H, vcfg);
 
             if (output_obs_count) {
@@ -309,7 +313,7 @@ static auto run_gridding(
           if (config["origin"].string() == "xy") flipud(gridded);
 
           auto lock = std::lock_guard<std::mutex>{mut_netcdf};
-          ctx.data_vars.at(field)->write(gridded, {i});
+          ctx.write_field(field, gridded, i);
         }
       }
     };
