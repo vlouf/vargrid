@@ -26,6 +26,9 @@ struct observation_operator {
   // Per-cell azimuth from radar (degrees) — for Wx/Wy weights.
   std::vector<float> cell_azimuth_deg;
 
+  // Per-cell ground range from radar (m) — for per-cell f computation.
+  std::vector<float> cell_range;
+
   auto grid_size() const -> size_t { return grid_nx * grid_ny; }
 };
 

@@ -48,7 +48,7 @@ auto precompute_grid_bearings(
 
   gb.n_bearing_bins = 720;
   gb.bearing_bin_size = 360.0f / gb.n_bearing_bins;
-  gb.range_bin_size = 500.0f;
+  gb.range_bin_size = 250.0f;  // match typical range gate spacing
   gb.n_range_bins = static_cast<size_t>(max_range / gb.range_bin_size) + 2;
   gb.max_range = max_range;
 
@@ -127,6 +127,7 @@ auto build_observation_operator(
   H.obs_count.resize(grid_nx * grid_ny, 0);
   H.kappa = cfg.kappa;
   H.cell_azimuth_deg = gb.cell_bearing_deg;
+  H.cell_range = gb.cell_range;
 
   size_t topscan = 0;
   for (size_t iscan = 1; iscan < vol.sweeps.size(); iscan++) {

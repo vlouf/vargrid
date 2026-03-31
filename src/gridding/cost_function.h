@@ -96,61 +96,57 @@ inline auto evaluate_gradient(
     for (size_t i = 0; i < n; ++i)
       grad[i] += cfg.lambda_h * work[i];
   } else {
-    // Second-order with azimuthal weights
+    // Second-order smoothness with azimuthal weights (Brook et al. 2022 Eq. 2-3)
+    // plus a first-order Laplacian damping term to suppress biharmonic ringing.
+    //
+    //   Js = Σ [ Wx·φ_xx² + Wy·φ_yy² ]   (second-order, spreads information)
+    //   Jd = Σ_edges (φ[j] - φ[k])²       (first-order, damps oscillations)
+    //
+    //   Total smoothness = λH · Js + (λH/10) · Jd
+    //
+    // The first-order term is weighted at 1/10 of λH — just enough to
+    // suppress ringing without dominating the second-order behaviour.
+
     compute_dxx(x, work, nx, ny);
     compute_dyy(x, work + n, nx, ny);
 
-    bool use_az = (cfg.range_spacing > 0.0f) && !H.cell_azimuth_deg.empty();
+    bool use_az = (cfg.range_spacing > 0.0f)
+              && !H.cell_azimuth_deg.empty()
+              && !H.cell_range.empty();
 
-    // Precompute a global f value from mid-range
-    float f = 1.0f, A = 0.0f, C = 1.0f;
-    if (use_az) {
-      float mid_range = 75000.0f;
-      float delta_phi = cfg.beamwidth * (M_PI / 180.0f) * mid_range;
-      f = cfg.range_spacing / delta_phi;
-      if (f > 1.0f) f = 1.0f;
-      A = std::fabs(f - 1.0f) / 2.0f;
-      C = (f + 1.0f) / 2.0f;
-    }
-
-    Js = 0.0f;
-    for (size_t i = 0; i < n; ++i) {
-      float Wx = C, Wy = C;
-      if (use_az) {
-        float cos2phi = std::cos(2.0f * H.cell_azimuth_deg[i] * (M_PI / 180.0f));
-        Wx = C - A * cos2phi;
-        Wy = C + A * cos2phi;
-      }
-      // Weighted second derivatives
-      work[i] *= Wx;
-      work[n + i] *= Wy;
-      Js += Wx * work[i] * work[i] / (Wx * Wx + 1e-12f)
-          + Wy * work[n+i] * work[n+i] / (Wy * Wy + 1e-12f);
-      // Simplify: Js += work[i]² / Wx + work[n+i]² / Wy ... no.
-      // Actually work[i] is already Wx * φ_xx, so:
-      // Js contribution should be Wx * φ_xx² + Wy * φ_yy²
-      // But work[i] = Wx * φ_xx now. We need to undo for cost...
-    }
-    // Let me redo this more cleanly:
-    // Recompute fresh
-    compute_dxx(x, work, nx, ny);
-    compute_dyy(x, work + n, nx, ny);
-
+    // --- Second-order cost and weighted derivatives ---
     Js = 0.0f;
     for (size_t i = 0; i < n; ++i) {
       float Wx = 1.0f, Wy = 1.0f;
+
       if (use_az) {
-        float cos2phi = std::cos(2.0f * H.cell_azimuth_deg[i] * (M_PI / 180.0f));
-        Wx = C - A * cos2phi;
-        Wy = C + A * cos2phi;
+        // Only apply anisotropic weights where azimuthal spacing >> range spacing.
+        // Near the radar (< 20km), the grid is well-sampled in all directions
+        // so isotropic smoothing is appropriate. This avoids rapidly varying
+        // weights that cause solver oscillations at low altitudes.
+        float cell_r = H.cell_range[i];
+        if (cell_r < 20000.0f) {
+          // Isotropic — leave Wx = Wy = 1
+        } else {
+          float delta_phi = cfg.beamwidth * (M_PI / 180.0f) * cell_r;
+          float f = cfg.range_spacing / delta_phi;
+          if (f > 1.0f) f = 1.0f;
+
+          float Af = std::fabs(f - 1.0f) / 2.0f;
+          float Cf = (f + 1.0f) / 2.0f;
+          float cos2phi = std::cos(2.0f * H.cell_azimuth_deg[i] * (M_PI / 180.0f));
+
+          Wx = Cf - Af * cos2phi;
+          Wy = Cf + Af * cos2phi;
+        }
       }
+
       Js += Wx * work[i] * work[i] + Wy * work[n + i] * work[n + i];
-      // Multiply derivatives by weight for adjoint pass
       work[i] *= Wx;
       work[n + i] *= Wy;
     }
 
-    // Gradient: 2 * (Dxx^T(Wx·φ_xx) + Dyy^T(Wy·φ_yy))
+    // --- Second-order gradient: 2 · (Dxx^T(Wx·φ_xx) + Dyy^T(Wy·φ_yy)) ---
     for (size_t j = 0; j < ny; ++j)
       for (size_t i = 0; i < nx; ++i) {
         size_t idx = j * nx + i;
@@ -165,6 +161,32 @@ inline auto evaluate_gradient(
 
         grad[idx] += 2.0f * cfg.lambda_h * (g_xx + g_yy);
       }
+
+    // --- First-order damping term: suppresses biharmonic ringing ---
+    // Equal weight with the second-order term provides effective
+    // oscillation damping while preserving the information-spreading
+    // property of the second-order penalty.
+    float lambda_damp = cfg.lambda_h;
+    float Jd = 0.0f;
+    for (size_t j = 0; j < ny; ++j)
+      for (size_t i = 0; i < nx; ++i) {
+        size_t idx = j * nx + i;
+        float center = x[idx];
+        float g = 0.0f;
+
+        if (i > 0)      { float d = center - x[idx-1];  g += d; }
+        if (i < nx - 1) { float d = center - x[idx+1];  g += d; }
+        if (j > 0)      { float d = center - x[idx-nx]; g += d; }
+        if (j < ny - 1) { float d = center - x[idx+nx]; g += d; }
+
+        // Cost: count each edge once (right and down only)
+        if (i < nx - 1) { float d = center - x[idx+1];  Jd += d * d; }
+        if (j < ny - 1) { float d = center - x[idx+nx]; Jd += d * d; }
+
+        grad[idx] += 2.0f * lambda_damp * g;
+      }
+
+    Js += Jd;  // first-order damping included at same weight
   }
 
   return Jo + cfg.lambda_h * Js;
