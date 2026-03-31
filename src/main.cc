@@ -16,47 +16,54 @@ using namespace bom;
 
 constexpr auto example_config =
 R"(# vargrid configuration
+# =====================
 
-# domain projection
+# --- Grid geometry (required) ---
+
+# Map projection (PROJ4 string)
 proj4 "+proj=aea +lat_1=-32.2 +lat_2=-35.2 +lon_0=151.209 +lat_0=-33.7008 +a=6378137 +b=6356752.31414 +units=m"
 
-# grid size
+# Grid dimensions (nx ny)
 size "301 301"
 
-# top left coordinates
+# Top-left corner in projected coordinates
 left_top "-150500 150500"
 
-# grid resolution
+# Cell size in projected coordinates (dx dy, negative dy = y increases downward)
 cell_delta "1000 -1000"
 
-# horizontal grid units
+# Coordinate units
 units m
 
-# altitude of lowest layer (m)
-altitude_base 0.0
-
-# altitude step between layers (m)
-altitude_step 500.0
-
-# number of layers
-layer_count 13
-
-# Matrix orientation
+# Matrix orientation: "xy" (geographic, y-axis flipped) or "ij" (matrix)
 origin xy
 
-# gridding method: "cappi" (IDW) or "variational"
+# --- Altitude layers ---
+
+altitude_base 0.0
+altitude_step 500.0
+layer_count 13
+
+# --- Gridding method ---
+
+# "variational" (Brook et al. 2022 inspired) or "cappi" (IDW baseline)
 gridding_method variational
 
-# velocity field name (for undetect handling)
-velocity VRADH
-
-# Field selection (optional):
-#   include_fields "DBZH VRADH ZDR"    - only grid these fields
-#   exclude_fields "SQI CCOR"          - grid everything except these
-# If neither is set, all fields found in the volume are gridded.
+# --- Field selection (optional) ---
+# By default, all fields in the input volume are gridded.
+# include_fields "DBZH VRADH ZDR"    - only grid these fields
+# exclude_fields "SQI CCOR"          - grid everything except these
 # include_fields takes precedence if both are set.
 
-# Output observation count per field (true/false, default false)
+# Velocity field name (controls undetect/nodata handling)
+velocity VRADH
+
+# --- Output options ---
+
+# Pack data as int16 with CF scale_factor/add_offset (reduces file size ~50%)
+pack_output true
+
+# Write observation count diagnostic fields (nobs_FIELD)
 output_obs_count false
 
 # Pack output data as int16 with scale_factor/add_offset (default true).
@@ -68,22 +75,47 @@ pack_output true
 max_alt_dist 20000
 idw_pwr 2.0
 
-# --- Variational gridding parameters ---
-vargrid_alpha 1.0
+# --- Variational parameters (gridding_method = variational) ---
+
+# Smoothing weight: second-order horizontal smoothness (Brook et al. 2022).
+# Controls trade-off between data fidelity and spatial smoothness.
+# Higher = smoother. Typical range: 0.001 - 1.0
+vargrid_lambda_h 0.01
+
+# Maximum altitude difference (m) for gate-to-layer assignment
 vargrid_max_alt_diff 2000
-vargrid_max_iterations 50
+
+# Conjugate gradient solver limits
+vargrid_max_iterations 200
 vargrid_tolerance 1e-5
+
+# Observation error model: beam volume scaling.
+# Weight = (ref_range / slant_range)^beam_power * altitude_weight
+# beam_power=2: inverse-area (pulse volume grows as range^2)
+# ref_range: gates closer than this get weight 1.0 (clamped)
 vargrid_beam_power 2.0
 vargrid_ref_range 10000
 vargrid_min_weight 0.01
+
+# Initial guess: nearest-gate weighted mean (faster convergence)
 vargrid_use_nearest_init true
 
-# Perona-Malik edge threshold (in data units, e.g. dBZ).
-# Gradients larger than kappa are preserved (storm edges),
-# gradients smaller than kappa are smoothed.
-# Set to 0 to disable edge-preservation (isotropic Laplacian).
+# Perona-Malik edge preservation threshold (data units, e.g. dBZ).
+# Gradients >> kappa are preserved, gradients << kappa are smoothed.
+# Set to 0 to use second-order smoothness only (recommended default).
 # Typical: 5-15 dBZ for reflectivity, 2-5 m/s for velocity.
-vargrid_kappa 10.0
+vargrid_kappa 0
+
+# Azimuthal weights (Brook et al. 2022 Eq. 3).
+# Smoothing is stronger along azimuths (coarser spacing) than range.
+# range_spacing = radar range gate spacing in meters.
+# Set to 0 to disable azimuthal weighting.
+vargrid_range_spacing 250
+
+# Mask distance: cells further than this many grid cells from any
+# observation are set to NaN. Controls extrapolation extent.
+# 3 = tight (like CAPPI), 10 = generous fill.
+vargrid_mask_distance 3
 
 )";
 
@@ -156,16 +188,18 @@ static auto select_fields(
 static auto parse_vargrid_config(io::configuration const& config, float beamwidth) -> vargrid_config
 {
   vargrid_config cfg;
-  cfg.alpha = std::stof(config.optional("vargrid_alpha", "1.0"));
-  cfg.max_alt_diff = std::stof(config.optional("vargrid_max_alt_diff", "2000"));
-  cfg.max_iterations = std::stoi(config.optional("vargrid_max_iterations", "50"));
-  cfg.tolerance = std::stof(config.optional("vargrid_tolerance", "1e-5"));
-  cfg.beam_power = std::stof(config.optional("vargrid_beam_power", "2.0"));
-  cfg.ref_range = std::stof(config.optional("vargrid_ref_range", "10000"));
-  cfg.min_weight = std::stof(config.optional("vargrid_min_weight", "0.01"));
+  cfg.lambda_h       = std::stof(config.optional("vargrid_lambda_h", "0.01"));
+  cfg.max_alt_diff   = std::stof(config.optional("vargrid_max_alt_diff", "2000"));
+  cfg.max_iterations = std::stoi(config.optional("vargrid_max_iterations", "200"));
+  cfg.tolerance      = std::stof(config.optional("vargrid_tolerance", "1e-5"));
+  cfg.beam_power     = std::stof(config.optional("vargrid_beam_power", "2.0"));
+  cfg.ref_range      = std::stof(config.optional("vargrid_ref_range", "10000"));
+  cfg.min_weight     = std::stof(config.optional("vargrid_min_weight", "0.01"));
   cfg.use_nearest_init = std::string(config.optional("vargrid_use_nearest_init", "true")) != "false";
-  cfg.kappa = std::stof(config.optional("vargrid_kappa", "10.0"));
-  cfg.beamwidth = beamwidth;
+  cfg.kappa          = std::stof(config.optional("vargrid_kappa", "0"));
+  cfg.range_spacing  = std::stof(config.optional("vargrid_range_spacing", "250"));
+  cfg.mask_distance_cells = std::stof(config.optional("vargrid_mask_distance", "3"));
+  cfg.beamwidth      = beamwidth;
   return cfg;
 }
 
@@ -210,7 +244,7 @@ static auto run_gridding(
 
   // --- Read metadata and volumes ---
   auto meta = read_metadata(vol_odim);
-  auto velocity_field = config.optional("velocity", "VRADH");
+  std::string velocity_field = config.optional("velocity", "VRADH");
 
   std::map<std::string, volume> volumes;
   {
@@ -221,29 +255,25 @@ static auto run_gridding(
     }
   }
 
-  auto method = config.optional("gridding_method", "cappi");
+  std::string method = config.optional("gridding_method", "cappi");
   trace::log("Gridding method: {}", method);
 
   auto vcfg = parse_vargrid_config(config, meta.beamwidth);
   auto output_obs_count = std::string(config.optional("output_obs_count", "false")) == "false" ? false : true;
   auto pack_output = std::string(config.optional("pack_output", "true")) == "false" ? false : true;
 
-  // --- Precompute gate projections (variational only, main thread) ---
-  gate_projections gp;
-  double x0 = 0, y0 = 0, dx = 1, dy = 1;
+  // --- Precompute grid bearings (variational only, main thread) ---
+  grid_bearings gb;
+  float grid_spacing = 1000.0f;  // default, will be computed from config
   if (method == "variational") {
-    phase_timer t("Precomputing gate projections");
-    gp = precompute_gate_projections(volumes.begin()->second, proj4_string);
+    phase_timer t("Precomputing grid bearings");
+    gb = precompute_grid_bearings(volumes.begin()->second.location, latlons);
 
+    // Compute grid spacing from cell_delta config
     auto col_edges = coords.col_edges();
-    auto row_edges = coords.row_edges();
-    x0 = 0.5 * (col_edges[0] + col_edges[1]);
-    y0 = 0.5 * (row_edges[0] + row_edges[1]);
-    double x_last = 0.5 * (col_edges[grid_nx - 1] + col_edges[grid_nx]);
-    double y_last = 0.5 * (row_edges[grid_ny - 1] + row_edges[grid_ny]);
-    dx = (x_last - x0) / (static_cast<double>(grid_nx) - 1.0);
-    dy = (y_last - y0) / (static_cast<double>(grid_ny) - 1.0);
-    trace::debug("Grid origin: ({:.1f}, {:.1f}), spacing: ({:.1f}, {:.1f})", x0, y0, dx, dy);
+    grid_spacing = static_cast<float>(std::fabs(col_edges[1] - col_edges[0]));
+    trace::debug("Grid spacing: {:.0f}m, grid bearings computed for {}x{} cells",
+      grid_spacing, grid_nx, grid_ny);
   }
 
   // --- Prepare output coordinates ---
@@ -285,6 +315,8 @@ static auto run_gridding(
     if (num_workers == 0) num_workers = 4;
 
     std::atomic<size_t> next_layer{0};
+    std::atomic<size_t> completed_tasks{0};
+    size_t total_tasks = altitudes.size() * selected_fields.size();
     std::mutex mut_netcdf;
 
     auto worker = [&]() {
@@ -298,8 +330,8 @@ static auto run_gridding(
 
           if (method == "variational") {
             auto H = build_observation_operator(
-              vol, gp, x0, y0, dx, dy, grid_nx, grid_ny, altitudes[i], vcfg);
-            gridded = variational_grid(H, vcfg);
+              vol, gb, grid_nx, grid_ny, altitudes[i], grid_spacing, vcfg);
+            gridded = variational_grid(H, vcfg, total_tasks, completed_tasks);
 
             if (output_obs_count) {
               auto nobs = observation_density(H);

@@ -6,7 +6,8 @@
 #include <cstddef>
 #include <cmath>
 
-// A single observation: one radar gate contributing to the grid.
+namespace bom { class angle; struct latlon; struct latlonalt; template<typename T> class array2; }
+
 struct observation {
   size_t grid_index;
   float value;
@@ -14,31 +15,35 @@ struct observation {
   float alt_dist;
 };
 
-// Sparse mapping from radar gates to grid cells.
 struct observation_operator {
   std::vector<observation> obs;
   size_t grid_nx;
   size_t grid_ny;
   std::vector<int> obs_count;
 
-  // Perona-Malik edge threshold. When > 0, edge-preserving smoothness
-  // is used. When <= 0, falls back to isotropic Laplacian.
   float kappa = 0.0f;
+
+  // Per-cell azimuth from radar (degrees) — for Wx/Wy weights.
+  std::vector<float> cell_azimuth_deg;
 
   auto grid_size() const -> size_t { return grid_nx * grid_ny; }
 };
 
-// Precomputed projected coordinates for all gates in one sweep.
-struct sweep_projections {
-  std::vector<double> px;  // projected x (easting)
-  std::vector<double> py;  // projected y (northing)
-  size_t nrays;
-  size_t nbins;
-};
+// Precomputed bearing/range lookup for mapping gates to grid cells.
+struct grid_bearings {
+  std::vector<float> cell_bearing_deg;  // [ny * nx]
+  std::vector<float> cell_range;        // [ny * nx]
 
-// Precomputed projections for all sweeps in a volume.
-struct gate_projections {
-  std::vector<sweep_projections> sweeps;
+  std::vector<size_t> bin_to_grid;
+
+  size_t n_bearing_bins;
+  size_t n_range_bins;
+  float bearing_bin_size;
+  float range_bin_size;
+  float max_range;
+
+  size_t nx;
+  size_t ny;
 };
 
 #endif // VARGRID_GRIDDING_OBSERVATION_OPERATOR_H

@@ -20,40 +20,58 @@ static void compute_initial_guess(float* x, const observation_operator& H, float
   }
 }
 
-static void mask_unconstrained(float* x, const observation_operator& H)
+// Mask cells far from any observation using BFS distance.
+// Cells with no observation within mask_distance grid steps are set to NaN.
+static void mask_by_distance(float* x, const observation_operator& H, float max_dist)
 {
   size_t n = H.grid_size();
   size_t nx = H.grid_nx;
   size_t ny = H.grid_ny;
 
-  constexpr int propagation_steps = 3;
-  std::vector<bool> has_data(n, false);
+  // BFS from cells that have observations
+  std::vector<float> dist(n, std::numeric_limits<float>::max());
+  std::vector<size_t> frontier;
 
-  for (size_t i = 0; i < n; ++i)
-    has_data[i] = (H.obs_count[i] > 0);
-
-  std::vector<bool> next(n, false);
-  for (int step = 0; step < propagation_steps; ++step) {
-    for (size_t j = 0; j < ny; ++j) {
-      for (size_t i = 0; i < nx; ++i) {
-        size_t idx = j * nx + i;
-        if (has_data[idx]) { next[idx] = true; continue; }
-        bool nb = false;
-        if (i > 0      && has_data[idx - 1])  nb = true;
-        if (i < nx - 1 && has_data[idx + 1])  nb = true;
-        if (j > 0      && has_data[idx - nx]) nb = true;
-        if (j < ny - 1 && has_data[idx + nx]) nb = true;
-        next[idx] = nb;
-      }
+  for (size_t i = 0; i < n; ++i) {
+    if (H.obs_count[i] > 0) {
+      dist[i] = 0.0f;
+      frontier.push_back(i);
     }
-    std::swap(has_data, next);
+  }
+
+  float current_dist = 0.0f;
+  while (!frontier.empty() && current_dist < max_dist) {
+    current_dist += 1.0f;
+    std::vector<size_t> next;
+    for (auto idx : frontier) {
+      size_t iy = idx / nx;
+      size_t ix = idx % nx;
+      auto try_cell = [&](size_t cx, size_t cy) {
+        size_t cidx = cy * nx + cx;
+        if (dist[cidx] > current_dist) {
+          dist[cidx] = current_dist;
+          next.push_back(cidx);
+        }
+      };
+      if (ix > 0)       try_cell(ix - 1, iy);
+      if (ix < nx - 1)  try_cell(ix + 1, iy);
+      if (iy > 0)       try_cell(ix, iy - 1);
+      if (iy < ny - 1)  try_cell(ix, iy + 1);
+    }
+    frontier = std::move(next);
   }
 
   for (size_t i = 0; i < n; ++i)
-    if (!has_data[i]) x[i] = nodata;
+    if (dist[i] > max_dist)
+      x[i] = nodata;
 }
 
-auto variational_grid(const observation_operator& H, const vargrid_config& cfg) -> array2f
+auto variational_grid(
+      const observation_operator& H
+    , const vargrid_config& cfg
+    , size_t total_tasks
+    , std::atomic<size_t>& completed_tasks
+    ) -> array2f
 {
   size_t nx = H.grid_nx;
   size_t ny = H.grid_ny;
@@ -69,13 +87,17 @@ auto variational_grid(const observation_operator& H, const vargrid_config& cfg) 
 
   if (!H.obs.empty()) {
     auto sr = solve_cg(result.data(), H, cfg);
-    trace::log("  Variational grid: {} iter, cost={:.4f}, residual={:.2e}, converged={}",
-      sr.iterations, sr.final_cost, sr.final_residual, sr.converged ? "yes" : "no");
+
+    auto done = completed_tasks.fetch_add(1) + 1;
+    int pct = static_cast<int>(100.0 * done / total_tasks);
+    trace::log("  [{:3d}%] Variational: {} iter, cost={:.1f}, residual={:.2e}, {}",
+      pct, sr.iterations, sr.final_cost, sr.final_residual,
+      sr.converged ? "converged" : "not converged");
   } else {
-    trace::warning("  Variational grid: no observations for this layer");
+    completed_tasks.fetch_add(1);
   }
 
-  mask_unconstrained(result.data(), H);
+  mask_by_distance(result.data(), H, cfg.mask_distance_cells);
   return result;
 }
 

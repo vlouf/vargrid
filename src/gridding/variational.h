@@ -5,27 +5,32 @@
 #include "observation_operator.h"
 #include "solver.h"
 #include "../types.h"
+#include <atomic>
 
-// Precompute projected coordinates for all radar gates (main thread only).
-auto precompute_gate_projections(
-      volume const& vol
-    , string const& proj4_string
-    ) -> gate_projections;
+// Precompute bearing and range from radar to each grid cell (main thread).
+auto precompute_grid_bearings(
+      latlonalt const& radar_location
+    , array2<latlon> const& latlons
+    ) -> grid_bearings;
 
 // Build observation operator for a single altitude layer (thread-safe).
 auto build_observation_operator(
       volume const& vol
-    , gate_projections const& gp
-    , double x0, double y0, double dx, double dy
-    , size_t grid_nx, size_t grid_ny
+    , grid_bearings const& gb
+    , size_t grid_nx
+    , size_t grid_ny
     , float altitude
+    , float grid_spacing
     , const vargrid_config& cfg
     ) -> observation_operator;
 
 // Variational gridding from a precomputed observation operator.
+// total_tasks and completed_tasks are for progress logging.
 auto variational_grid(
       const observation_operator& H
     , const vargrid_config& cfg
+    , size_t total_tasks
+    , std::atomic<size_t>& completed_tasks
     ) -> array2f;
 
 // Observation count per grid cell (diagnostic).

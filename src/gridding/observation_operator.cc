@@ -2,7 +2,6 @@
 #include "config.h"
 #include "../types.h"
 
-// Compute observation weight (inverse error variance) for a radar gate.
 static auto compute_weight(
       float slant_range
     , float alt_dist
@@ -20,64 +19,105 @@ static auto compute_weight(
   return std::max(w, cfg.min_weight);
 }
 
-// Precompute projected coordinates for all radar gates (main thread only).
-auto precompute_gate_projections(
-      volume const& vol
-    , string const& proj4_string
-    ) -> gate_projections
+auto precompute_grid_bearings(
+      latlonalt const& radar_location
+    , array2<latlon> const& latlons
+    ) -> grid_bearings
 {
-  gate_projections gp;
+  grid_bearings gb;
+  auto ny = latlons.extents().y;
+  auto nx = latlons.extents().x;
+  gb.nx = nx;
+  gb.ny = ny;
 
-  auto radarloc = latlon{vol.location.lon, vol.location.lat};
-  auto geo = map_projection{map_projection::default_context, "+proj=longlat +datum=WGS84"};
-  auto proj = map_projection{map_projection::default_context, proj4_string};
+  gb.cell_bearing_deg.resize(ny * nx);
+  gb.cell_range.resize(ny * nx);
+  float max_range = 0;
 
-  gp.sweeps.resize(vol.sweeps.size());
-
-  for (size_t iscan = 0; iscan < vol.sweeps.size(); ++iscan) {
-    auto& scan = vol.sweeps[iscan];
-    auto nrays = scan.rays.size();
-    auto nbins = scan.bins.size();
-
-    gp.sweeps[iscan].nrays = nrays;
-    gp.sweeps[iscan].nbins = nbins;
-
-    constexpr double deg2rad = M_PI / 180.0;
-
-    std::vector<vec2d> xy(nrays * nbins);
-
-    for (size_t iray = 0; iray < nrays; ++iray) {
-      for (size_t ibin = 0; ibin < nbins; ++ibin) {
-        auto gate_ll = wgs84.bearing_range_to_latlon(
-          radarloc, scan.rays[iray], scan.bins[ibin].ground_range);
-        size_t idx = iray * nbins + ibin;
-        xy[idx] = vec2d{gate_ll.lon.degrees() * deg2rad, gate_ll.lat.degrees() * deg2rad};
-      }
-    }
-
-    // Batch transform: geographic (radians) -> projected CRS
-    auto xy_span = span<vec2d>{xy.data(), static_cast<ptrdiff_t>(xy.size())};
-    map_projection::transform(geo, proj, xy_span);
-
-    // Extract projected coordinates
-    gp.sweeps[iscan].px.resize(nrays * nbins);
-    gp.sweeps[iscan].py.resize(nrays * nbins);
-    for (size_t i = 0; i < xy.size(); ++i) {
-      gp.sweeps[iscan].px[i] = xy[i].x;
-      gp.sweeps[iscan].py[i] = xy[i].y;
+  for (size_t y = 0; y < ny; ++y) {
+    for (size_t x = 0; x < nx; ++x) {
+      auto br = wgs84.latlon_to_bearing_range(radar_location, latlons[y][x]);
+      size_t idx = y * nx + x;
+      float b = br.first.normalize().degrees();
+      if (b < 0) b += 360.0f;
+      gb.cell_bearing_deg[idx] = b;
+      gb.cell_range[idx] = br.second;
+      if (br.second > max_range) max_range = br.second;
     }
   }
 
-  return gp;
+  gb.n_bearing_bins = 720;
+  gb.bearing_bin_size = 360.0f / gb.n_bearing_bins;
+  gb.range_bin_size = 500.0f;
+  gb.n_range_bins = static_cast<size_t>(max_range / gb.range_bin_size) + 2;
+  gb.max_range = max_range;
+
+  size_t total_bins = gb.n_bearing_bins * gb.n_range_bins;
+  gb.bin_to_grid.assign(total_bins, static_cast<size_t>(-1));
+  std::vector<float> bin_dist(total_bins, std::numeric_limits<float>::max());
+
+  for (size_t idx = 0; idx < ny * nx; ++idx) {
+    int ib = static_cast<int>(gb.cell_bearing_deg[idx] / gb.bearing_bin_size);
+    if (ib < 0) ib = 0;
+    if (ib >= static_cast<int>(gb.n_bearing_bins)) ib = gb.n_bearing_bins - 1;
+
+    int ir = static_cast<int>(gb.cell_range[idx] / gb.range_bin_size);
+    if (ir < 0) ir = 0;
+    if (ir >= static_cast<int>(gb.n_range_bins)) ir = gb.n_range_bins - 1;
+
+    size_t bin_idx = static_cast<size_t>(ib) * gb.n_range_bins + static_cast<size_t>(ir);
+
+    float bearing_center = (ib + 0.5f) * gb.bearing_bin_size;
+    float range_center = (ir + 0.5f) * gb.range_bin_size;
+    float db = gb.cell_bearing_deg[idx] - bearing_center;
+    float dr = gb.cell_range[idx] - range_center;
+    float dist = db * db + (dr / gb.range_bin_size) * (dr / gb.range_bin_size);
+
+    if (dist < bin_dist[bin_idx]) {
+      bin_dist[bin_idx] = dist;
+      gb.bin_to_grid[bin_idx] = idx;
+    }
+  }
+
+  trace::debug("Grid bearing lookup: {} bearing bins x {} range bins, max range={:.0f}m",
+    gb.n_bearing_bins, gb.n_range_bins, max_range);
+
+  return gb;
 }
 
-// Build observation operator for a single altitude layer (thread-safe).
+static auto lookup_nearest(
+      grid_bearings const& gb
+    , float bearing_deg
+    , float ground_range
+    ) -> size_t
+{
+  if (ground_range > gb.max_range || ground_range < 0)
+    return static_cast<size_t>(-1);
+
+  if (bearing_deg < 0) bearing_deg += 360.0f;
+  if (bearing_deg >= 360.0f) bearing_deg -= 360.0f;
+
+  int ib = static_cast<int>(bearing_deg / gb.bearing_bin_size);
+  if (ib < 0) ib = 0;
+  if (ib >= static_cast<int>(gb.n_bearing_bins)) ib = gb.n_bearing_bins - 1;
+
+  int ir = static_cast<int>(ground_range / gb.range_bin_size);
+  if (ir < 0) ir = 0;
+  if (ir >= static_cast<int>(gb.n_range_bins)) ir = gb.n_range_bins - 1;
+
+  size_t bin_idx = static_cast<size_t>(ib) * gb.n_range_bins + static_cast<size_t>(ir);
+  return gb.bin_to_grid[bin_idx];
+}
+
+// Build observation operator with nearest-neighbour mapping.
+// Each gate maps to exactly 1 grid cell — fast and clean.
 auto build_observation_operator(
       volume const& vol
-    , gate_projections const& gp
-    , double x0, double y0, double dx, double dy
-    , size_t grid_nx, size_t grid_ny
+    , grid_bearings const& gb
+    , size_t grid_nx
+    , size_t grid_ny
     , float altitude
+    , float grid_spacing
     , const vargrid_config& cfg
     ) -> observation_operator
 {
@@ -86,6 +126,7 @@ auto build_observation_operator(
   H.grid_ny = grid_ny;
   H.obs_count.resize(grid_nx * grid_ny, 0);
   H.kappa = cfg.kappa;
+  H.cell_azimuth_deg = gb.cell_bearing_deg;
 
   size_t topscan = 0;
   for (size_t iscan = 1; iscan < vol.sweeps.size(); iscan++) {
@@ -98,9 +139,7 @@ auto build_observation_operator(
 
   for (size_t iscan = 0; iscan < vol.sweeps.size(); ++iscan) {
     if (iscan == topscan) continue;
-
     auto& scan = vol.sweeps[iscan];
-    auto& sp = gp.sweeps[iscan];
 
     for (size_t ibin = 0; ibin < scan.bins.size(); ++ibin) {
       float alt_dist = scan.bins[ibin].altitude - altitude;
@@ -111,20 +150,16 @@ auto build_observation_operator(
         if (std::isnan(val)) continue;
         if (std::fabs(val - undetect) < 0.1f) continue;
 
-        size_t pidx = iray * sp.nbins + ibin;
-        double fx = (sp.px[pidx] - x0) / dx;
-        double fy = (sp.py[pidx] - y0) / dy;
+        float bearing_deg = scan.rays[iray].degrees();
+        if (bearing_deg < 0) bearing_deg += 360.0f;
+        float ground_range = scan.bins[ibin].ground_range;
 
-        int ix = static_cast<int>(std::round(fx));
-        int iy = static_cast<int>(std::round(fy));
-
-        if (ix < 0 || ix >= static_cast<int>(grid_nx) ||
-            iy < 0 || iy >= static_cast<int>(grid_ny)) {
+        auto grid_idx = lookup_nearest(gb, bearing_deg, ground_range);
+        if (grid_idx == static_cast<size_t>(-1)) {
           out_of_bounds++;
           continue;
         }
 
-        size_t grid_idx = static_cast<size_t>(iy) * grid_nx + static_cast<size_t>(ix);
         float w = compute_weight(scan.bins[ibin].slant_range, alt_dist, cfg.max_alt_diff, cfg);
 
         H.obs.push_back({grid_idx, val, w, alt_dist});
