@@ -12,8 +12,12 @@ static auto compute_weight(
   float effective_range = std::max(slant_range, cfg.ref_range);
   float w_beam = std::pow(cfg.ref_range / effective_range, cfg.beam_power);
 
-  float w_alt = 1.0f - std::fabs(alt_dist) / max_alt_diff;
-  if (w_alt < 0.0f) w_alt = 0.0f;
+  // Smooth altitude weight: cosine taper from 1 at alt_dist=0 to 0 at max_alt_diff.
+  // Smoother than linear — avoids creating observation density discontinuities
+  // at sweep boundaries that cause solver ringing artefacts.
+  float t = std::fabs(alt_dist) / max_alt_diff;
+  if (t >= 1.0f) return 0.0f;
+  float w_alt = 0.5f * (1.0f + std::cos(M_PI * t));  // cosine taper: 1 at t=0, 0 at t=1
 
   float w = w_beam * w_alt;
   return std::max(w, cfg.min_weight);
@@ -176,7 +180,10 @@ auto build_observation_operator(
 
     for (size_t ibin = 0; ibin < scan.bins.size(); ++ibin) {
       float alt_dist = scan.bins[ibin].altitude - altitude;
-      if (std::fabs(alt_dist) > cfg.max_alt_diff) continue;
+      // Soft cutoff: compute weight and skip if negligible.
+      // This avoids the hard max_alt_diff boundary that creates
+      // observation density discontinuities at sweep transitions.
+      if (std::fabs(alt_dist) > 1.5f * cfg.max_alt_diff) continue;  // hard limit for performance
 
       for (size_t iray = 0; iray < scan.rays.size(); ++iray) {
         float val = scan.data[iray][ibin];
@@ -194,6 +201,7 @@ auto build_observation_operator(
         }
 
         float w = compute_weight(scan.bins[ibin].slant_range, alt_dist, cfg.max_alt_diff, cfg);
+        if (w < 1e-6f) continue;  // skip negligible observations
 
         H.obs.push_back({grid_idx, val, w, alt_dist});
         H.obs_count[grid_idx]++;

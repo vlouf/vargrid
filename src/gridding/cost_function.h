@@ -7,29 +7,35 @@
 #include <cmath>
 
 // Cost function:
-//   J(φ) = Jo + λH · (Js2 + Js1)
+//   J(φ) = Jo + λH · Js
 //
-//   Jo  = Σ w_i (φ[g_i] - d_i)²
-//   Js2 = Σ [ Wx[k]·φ_xx[k]² + Wy[k]·φ_yy[k]² ]
-//   Js1 = Σ_edges (φ[j] - φ[k])²
+//   Jo = Σ w_i (φ[g_i] - d_i)²           (data fidelity)
+//   Js = Σ_edges w_e (φ_j - φ_k)²         (8-connected smoothness)
+//
+// The 8-connected stencil uses all 8 neighbours:
+//   Cardinal (left/right/up/down): weight 1.0
+//   Diagonal (corners):            weight 1/√2  (distance is √2 × cell size)
+//
+// This makes the smoothing nearly isotropic, eliminating the grid-axis-aligned
+// star artefacts that a 4-connected stencil produces on radial data.
+
+// Diagonal edge weight: 1/√2
+constexpr float DIAG_W = 0.70710678f;
 
 inline float pm_diffusivity(float diff_sq, float kappa_sq) {
   return 1.0f / (1.0f + diff_sq / kappa_sq);
 }
 
 // === Cost-only evaluation (no gradient) ===
-// Used by the line search — ~3× cheaper than full gradient evaluation.
 inline auto evaluate_cost(
     const float* __restrict__ x,
     const observation_operator& H,
     const vargrid_config& cfg
     ) -> float
 {
-  const size_t n = H.grid_size();
   const size_t nx = H.grid_nx;
   const size_t ny = H.grid_ny;
 
-  // Jo
   float Jo = 0.0f;
   for (const auto& obs : H.obs) {
     float r = x[obs.grid_index] - obs.value;
@@ -44,34 +50,24 @@ inline auto evaluate_cost(
       for (size_t i = 0; i < nx; ++i) {
         size_t idx = j * nx + i;
         float c = x[idx];
-        if (i < nx - 1) { float d = c - x[idx+1]; Js += kappa_sq * std::log(1.0f + d*d / kappa_sq); }
-        if (j < ny - 1) { float d = c - x[idx+nx]; Js += kappa_sq * std::log(1.0f + d*d / kappa_sq); }
+        // Cardinal edges (right and down)
+        if (i < nx-1) { float d = c - x[idx+1];  Js += kappa_sq * std::log(1.0f + d*d/kappa_sq); }
+        if (j < ny-1) { float d = c - x[idx+nx]; Js += kappa_sq * std::log(1.0f + d*d/kappa_sq); }
+        // Diagonal edges (down-right and down-left)
+        if (i < nx-1 && j < ny-1) { float d = c - x[idx+nx+1]; Js += DIAG_W * kappa_sq * std::log(1.0f + d*d/kappa_sq); }
+        if (i > 0    && j < ny-1) { float d = c - x[idx+nx-1]; Js += DIAG_W * kappa_sq * std::log(1.0f + d*d/kappa_sq); }
       }
   } else {
-    const bool has_az = !H.Wx.empty();
-    const float* pWx = has_az ? H.Wx.data() : nullptr;
-    const float* pWy = has_az ? H.Wy.data() : nullptr;
-
     for (size_t j = 0; j < ny; ++j)
       for (size_t i = 0; i < nx; ++i) {
         size_t idx = j * nx + i;
         float c = x[idx];
-        float left  = (i > 0)      ? x[idx-1] : c;
-        float right = (i < nx - 1) ? x[idx+1] : c;
-        float up    = (j > 0)      ? x[idx-nx] : c;
-        float down  = (j < ny - 1) ? x[idx+nx] : c;
-
-        float dxx = left - 2.0f * c + right;
-        float dyy = up - 2.0f * c + down;
-        float wx = has_az ? pWx[idx] : 1.0f;
-        float wy = has_az ? pWy[idx] : 1.0f;
-
-        // Second-order cost
-        Js += wx * dxx * dxx + wy * dyy * dyy;
-
-        // First-order damping cost (right and down edges only)
-        if (i < nx - 1) { float d = c - right; Js += d * d; }
-        if (j < ny - 1) { float d = c - down;  Js += d * d; }
+        // Cardinal edges (right and down)
+        if (i < nx-1) { float d = c - x[idx+1];  Js += d * d; }
+        if (j < ny-1) { float d = c - x[idx+nx]; Js += d * d; }
+        // Diagonal edges (down-right and down-left)
+        if (i < nx-1 && j < ny-1) { float d = c - x[idx+nx+1]; Js += DIAG_W * d * d; }
+        if (i > 0    && j < ny-1) { float d = c - x[idx+nx-1]; Js += DIAG_W * d * d; }
       }
   }
 
@@ -84,7 +80,7 @@ inline auto evaluate_gradient(
     float* __restrict__ grad,
     const observation_operator& H,
     const vargrid_config& cfg,
-    float* __restrict__ work   // size >= 2 * nx * ny
+    float* __restrict__ work   // unused but kept for API compatibility
     ) -> float
 {
   const size_t n = H.grid_size();
@@ -107,76 +103,51 @@ inline auto evaluate_gradient(
 
   if (H.kappa > 0.0f) {
     float kappa_sq = H.kappa * H.kappa;
-    // Perona-Malik: combined cost + gradient in single pass
     for (size_t j = 0; j < ny; ++j)
       for (size_t i = 0; i < nx; ++i) {
         size_t idx = j * nx + i;
         float c = x[idx];
-        float g_sum = 0.0f;
+        float g = 0.0f;
 
-        if (i < nx-1) { float d = c - x[idx+1]; g_sum += pm_diffusivity(d*d, kappa_sq) * d; Js += kappa_sq * std::log(1.0f + d*d/kappa_sq); }
-        if (j < ny-1) { float d = c - x[idx+nx]; g_sum += pm_diffusivity(d*d, kappa_sq) * d; Js += kappa_sq * std::log(1.0f + d*d/kappa_sq); }
-        if (i > 0)    { float d = c - x[idx-1]; g_sum += pm_diffusivity(d*d, kappa_sq) * d; }
-        if (j > 0)    { float d = c - x[idx-nx]; g_sum += pm_diffusivity(d*d, kappa_sq) * d; }
+        // Cardinal neighbours
+        if (i < nx-1) { float d = c-x[idx+1];  g += pm_diffusivity(d*d,kappa_sq)*d; Js += kappa_sq*std::log(1.0f+d*d/kappa_sq); }
+        if (i > 0)    { float d = c-x[idx-1];  g += pm_diffusivity(d*d,kappa_sq)*d; }
+        if (j < ny-1) { float d = c-x[idx+nx]; g += pm_diffusivity(d*d,kappa_sq)*d; Js += kappa_sq*std::log(1.0f+d*d/kappa_sq); }
+        if (j > 0)    { float d = c-x[idx-nx]; g += pm_diffusivity(d*d,kappa_sq)*d; }
 
-        grad[idx] += lh * 2.0f * g_sum;
+        // Diagonal neighbours (weight DIAG_W)
+        if (i<nx-1 && j<ny-1) { float d=c-x[idx+nx+1]; g+=DIAG_W*pm_diffusivity(d*d,kappa_sq)*d; Js+=DIAG_W*kappa_sq*std::log(1.0f+d*d/kappa_sq); }
+        if (i>0    && j<ny-1) { float d=c-x[idx+nx-1]; g+=DIAG_W*pm_diffusivity(d*d,kappa_sq)*d; Js+=DIAG_W*kappa_sq*std::log(1.0f+d*d/kappa_sq); }
+        if (i<nx-1 && j>0)    { float d=c-x[idx-nx+1]; g+=DIAG_W*pm_diffusivity(d*d,kappa_sq)*d; }
+        if (i>0    && j>0)    { float d=c-x[idx-nx-1]; g+=DIAG_W*pm_diffusivity(d*d,kappa_sq)*d; }
+
+        grad[idx] += 2.0f * lh * g;
       }
   } else {
-    float* __restrict__ wxx = work;
-    float* __restrict__ wyy = work + n;
-
-    const bool has_az = !H.Wx.empty();
-    const float* __restrict__ pWx = has_az ? H.Wx.data() : nullptr;
-    const float* __restrict__ pWy = has_az ? H.Wy.data() : nullptr;
-
-    // --- Pass 1: dxx, dyy, weights, Js2 cost, first-order damping ---
-    float Js2 = 0.0f, Jd = 0.0f;
+    // 8-connected isotropic Laplacian smoothness.
+    // Cardinal: weight 1.0,  Diagonal: weight 1/√2
+    // Gradient: ∇Js[k] = 2 Σ_neighbours w_e (φ[k] - φ[neighbour])
+    // Cost:     Js = Σ_edges w_e (φ_j - φ_k)² (each edge counted once)
 
     for (size_t j = 0; j < ny; ++j) {
       for (size_t i = 0; i < nx; ++i) {
         const size_t idx = j * nx + i;
         const float c = x[idx];
+        float g = 0.0f;
 
-        float left  = (i > 0)      ? x[idx-1] : c;
-        float right = (i < nx - 1) ? x[idx+1] : c;
-        float up    = (j > 0)      ? x[idx-nx] : c;
-        float down  = (j < ny - 1) ? x[idx+nx] : c;
+        // Cardinal neighbours (gradient from all 4, cost from right+down)
+        if (i > 0)    { g += c - x[idx-1]; }
+        if (i < nx-1) { float d = c - x[idx+1];  g += d; Js += d * d; }
+        if (j > 0)    { g += c - x[idx-nx]; }
+        if (j < ny-1) { float d = c - x[idx+nx]; g += d; Js += d * d; }
 
-        float dxx = left - 2.0f * c + right;
-        float dyy = up - 2.0f * c + down;
+        // Diagonal neighbours (gradient from all 4, cost from down-right+down-left)
+        if (i > 0    && j > 0)    { g += DIAG_W * (c - x[idx-nx-1]); }
+        if (i < nx-1 && j > 0)    { g += DIAG_W * (c - x[idx-nx+1]); }
+        if (i > 0    && j < ny-1) { float d = c - x[idx+nx-1]; g += DIAG_W * d; Js += DIAG_W * d * d; }
+        if (i < nx-1 && j < ny-1) { float d = c - x[idx+nx+1]; g += DIAG_W * d; Js += DIAG_W * d * d; }
 
-        float wx = has_az ? pWx[idx] : 1.0f;
-        float wy = has_az ? pWy[idx] : 1.0f;
-
-        Js2 += wx * dxx * dxx + wy * dyy * dyy;
-        wxx[idx] = wx * dxx;
-        wyy[idx] = wy * dyy;
-
-        // First-order damping: gradient + cost
-        float g1 = (c - left) + (c - right) + (c - up) + (c - down);
-        if (i < nx - 1) { float d = c - right; Jd += d * d; }
-        if (j < ny - 1) { float d = c - down;  Jd += d * d; }
-
-        grad[idx] += 2.0f * lh * g1;
-      }
-    }
-
-    Js = Js2 + Jd;
-
-    // --- Pass 2: Adjoint gradient for second-order term ---
-    for (size_t j = 0; j < ny; ++j) {
-      for (size_t i = 0; i < nx; ++i) {
-        const size_t idx = j * nx + i;
-
-        float xx_l = (i > 0)      ? wxx[idx-1] : wxx[idx];
-        float xx_r = (i < nx - 1) ? wxx[idx+1] : wxx[idx];
-        float g_xx = xx_l - 2.0f * wxx[idx] + xx_r;
-
-        float yy_u = (j > 0)      ? wyy[idx-nx] : wyy[idx];
-        float yy_d = (j < ny - 1) ? wyy[idx+nx] : wyy[idx];
-        float g_yy = yy_u - 2.0f * wyy[idx] + yy_d;
-
-        grad[idx] += 2.0f * lh * (g_xx + g_yy);
+        grad[idx] += 2.0f * lh * g;
       }
     }
   }
