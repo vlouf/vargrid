@@ -1,6 +1,7 @@
 #include <getopt.h>
 #include <atomic>
 #include <chrono>
+#include <cstdio>
 #include <functional>
 #include <mutex>
 
@@ -14,111 +15,6 @@
 
 using namespace bom;
 
-constexpr auto example_config =
-R"(# vargrid configuration
-# =====================
-
-# --- Grid geometry (required) ---
-
-# Map projection (PROJ4 string)
-proj4 "+proj=aea +lat_1=-32.2 +lat_2=-35.2 +lon_0=151.209 +lat_0=-33.7008 +a=6378137 +b=6356752.31414 +units=m"
-
-# Grid dimensions (nx ny)
-size "301 301"
-
-# Top-left corner in projected coordinates
-left_top "-150500 150500"
-
-# Cell size in projected coordinates (dx dy, negative dy = y increases downward)
-cell_delta "1000 -1000"
-
-# Coordinate units
-units m
-
-# Matrix orientation: "xy" (geographic, y-axis flipped) or "ij" (matrix)
-origin xy
-
-# --- Altitude layers ---
-
-altitude_base 0.0
-altitude_step 500.0
-layer_count 13
-
-# --- Gridding method ---
-
-# "variational" (Brook et al. 2022 inspired) or "cappi" (IDW baseline)
-gridding_method variational
-
-# --- Field selection (optional) ---
-# By default, all fields in the input volume are gridded.
-# include_fields "DBZH VRADH ZDR"    - only grid these fields
-# exclude_fields "SQI CCOR"          - grid everything except these
-# include_fields takes precedence if both are set.
-
-# Velocity field name (controls undetect/nodata handling)
-velocity VRADH
-
-# --- Output options ---
-
-# Pack data as int16 with CF scale_factor/add_offset (reduces file size ~50%)
-pack_output true
-
-# Write observation count diagnostic fields (nobs_FIELD)
-output_obs_count false
-
-# Pack output data as int16 with scale_factor/add_offset (default true).
-# Reduces file size by ~50% with negligible precision loss.
-# Set to false for full float32 output (e.g. for debugging).
-pack_output true
-
-# --- CAPPI parameters (used when gridding_method is "cappi") ---
-max_alt_dist 20000
-idw_pwr 2.0
-
-# --- Variational parameters (gridding_method = variational) ---
-
-# Smoothing weight: second-order horizontal smoothness (Brook et al. 2022).
-# Controls trade-off between data fidelity and spatial smoothness.
-# Higher = smoother. Typical range: 0.001 - 1.0
-vargrid_lambda_h 0.01
-
-# Maximum altitude difference (m) for gate-to-layer assignment
-vargrid_max_alt_diff 2000
-
-# Conjugate gradient solver limits
-vargrid_max_iterations 200
-vargrid_tolerance 1e-5
-
-# Observation error model: beam volume scaling.
-# Weight = (ref_range / slant_range)^beam_power * altitude_weight
-# beam_power=2: inverse-area (pulse volume grows as range^2)
-# ref_range: gates closer than this get weight 1.0 (clamped)
-vargrid_beam_power 2.0
-vargrid_ref_range 10000
-vargrid_min_weight 0.01
-
-# Initial guess: nearest-gate weighted mean (faster convergence)
-vargrid_use_nearest_init true
-
-# Perona-Malik edge preservation threshold (data units, e.g. dBZ).
-# Gradients >> kappa are preserved, gradients << kappa are smoothed.
-# Set to 0 to use second-order smoothness only (recommended default).
-# Typical: 5-15 dBZ for reflectivity, 2-5 m/s for velocity.
-vargrid_kappa 0
-
-# Azimuthal weights (Brook et al. 2022 Eq. 3).
-# Smoothing is stronger along azimuths (coarser spacing) than range.
-# range_spacing = radar range gate spacing in meters.
-# Set to 0 to disable azimuthal weighting.
-vargrid_range_spacing 250
-
-# Mask distance: cells further than this many grid cells from any
-# observation are set to NaN. Controls extrapolation extent.
-# 3 = tight (like CAPPI), 10 = generous fill.
-vargrid_mask_distance 3
-
-)";
-
 constexpr auto try_again = "try --help for usage instructions\n";
 constexpr auto usage_string =
 R"(Variational gridding of radar volume to Cartesian grid
@@ -130,8 +26,10 @@ available options:
   -h, --help
       Show this message and exit
 
-  -g, --generate
-      Output a sample configuration file and exit
+  -g, --generate [input.pvol.h5]
+      Output a sample configuration file and exit.
+      If an ODIM file is provided, the projection center (lat_0, lon_0)
+      is set to the radar position read from the file.
 
   -t, --trace=level
       Set logging level [log]
@@ -149,7 +47,103 @@ constexpr struct option long_options[] =
   , { 0, 0, 0, 0 }
 };
 
-// Determine which fields to grid based on include/exclude config.
+// Generate a configuration file, optionally reading radar position from an ODIM file.
+static void generate_config(const char* odim_path)
+{
+  double lat0 = -33.7008;
+  double lon0 = 151.209;
+  double lat1 = lat0 + 2.0;
+  double lat2 = lat0 - 2.0;
+  std::string source_comment = "# (default radar position — pass an ODIM file to vargrid -g to auto-populate)";
+
+  if (odim_path) {
+    try {
+      io::odim::polar_volume vol{std::filesystem::path(odim_path), io_mode::read_only};
+      lat0 = vol.latitude();
+      lon0 = vol.longitude();
+      lat1 = lat0 + 5.0;  // reasonable standard parallels for AEA
+      lat2 = lat0 - 5.0;
+
+      const auto& attrs = vol.attributes();
+      std::string src = attrs["source"].get_string();
+      source_comment = "# Radar: " + src;
+    } catch (std::exception& err) {
+      std::cerr << "Warning: could not read ODIM file: " << err.what() << "\n"
+                << "Using default radar position.\n";
+    }
+  }
+
+  // Use a fixed-precision format for the projection values
+  char proj4_line[512];
+  std::snprintf(proj4_line, sizeof(proj4_line),
+    "proj4 \"+proj=aea +lat_1=%.1f +lat_2=%.1f +lon_0=%.5f +lat_0=%.5f +units=m +ellps=GRS80\"",
+    lat1, lat2, lon0, lat0);
+
+  std::cout << "# vargrid configuration\n"
+            << "# =====================\n"
+            << source_comment << "\n"
+            << "\n"
+            << "# --- Grid geometry (required) ---\n"
+            << "\n"
+            << "# Map projection (PROJ4 string)\n"
+            << proj4_line << "\n"
+            << "\n"
+            << "# Grid dimensions (nx ny)\n"
+            << "size \"301 301\"\n"
+            << "\n"
+            << "# Top-left corner in projected coordinates\n"
+            << "left_top \"-150500 150500\"\n"
+            << "\n"
+            << "# Cell size in projected coordinates (dx dy, negative dy = y increases downward)\n"
+            << "cell_delta \"1000 -1000\"\n"
+            << "\n"
+            << "# Coordinate units\n"
+            << "units m\n"
+            << "\n"
+            << "# Matrix orientation: \"xy\" (geographic, y-axis flipped) or \"ij\" (matrix)\n"
+            << "origin xy\n"
+            << "\n"
+            << "# --- Altitude layers ---\n"
+            << "\n"
+            << "altitude_base 0.0\n"
+            << "altitude_step 500.0\n"
+            << "layer_count 13\n"
+            << "\n"
+            << "# --- Gridding method ---\n"
+            << "\n"
+            << "# \"variational\" (Brook et al. 2022 inspired) or \"cappi\" (IDW baseline)\n"
+            << "gridding_method variational\n"
+            << "\n"
+            << "# --- Field selection (optional) ---\n"
+            << "# include_fields \"DBZH VRADH ZDR\"\n"
+            << "# exclude_fields \"SQI CCOR\"\n"
+            << "\n"
+            << "velocity VRADH\n"
+            << "\n"
+            << "# --- Output options ---\n"
+            << "\n"
+            << "pack_output true\n"
+            << "output_obs_count false\n"
+            << "\n"
+            << "# --- CAPPI parameters ---\n"
+            << "\n"
+            << "max_alt_dist 20000\n"
+            << "idw_pwr 2.0\n"
+            << "\n"
+            << "# --- Variational parameters ---\n"
+            << "\n"
+            << "vargrid_lambda_h 0.01\n"
+            << "vargrid_max_alt_diff 2000\n"
+            << "vargrid_max_iterations 200\n"
+            << "vargrid_tolerance 1e-5\n"
+            << "vargrid_beam_power 2.0\n"
+            << "vargrid_ref_range 10000\n"
+            << "vargrid_min_weight 0.01\n"
+            << "vargrid_use_nearest_init true\n"
+            << "vargrid_kappa 0\n"
+            << "vargrid_range_spacing 250\n"
+            << "vargrid_mask_distance 3\n";
+}
 static auto select_fields(
       std::vector<std::string> const& available
     , io::configuration const& config
@@ -364,16 +358,25 @@ int main(int argc, char* argv[])
 {
   try
   {
+    bool do_generate = false;
+
     while (true) {
       int option_index = 0;
       int c = getopt_long(argc, argv, short_options, long_options, &option_index);
       if (c == -1) break;
       switch (c) {
       case 'h': std::cout << usage_string; return EXIT_SUCCESS;
-      case 'g': std::cout << example_config; return EXIT_SUCCESS;
+      case 'g': do_generate = true; break;
       case 't': trace::set_min_level(from_string<trace::level>(optarg)); break;
       case '?': std::cerr << try_again; return EXIT_FAILURE;
       }
+    }
+
+    if (do_generate) {
+      // Check if an ODIM file was passed as a positional argument
+      const char* odim_path = (optind < argc) ? argv[optind] : nullptr;
+      generate_config(odim_path);
+      return EXIT_SUCCESS;
     }
 
     std::vector<std::string> positional_args;
