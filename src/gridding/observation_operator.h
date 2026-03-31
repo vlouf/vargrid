@@ -23,11 +23,11 @@ struct observation_operator {
 
   float kappa = 0.0f;
 
-  // Per-cell azimuth from radar (degrees) — for Wx/Wy weights.
-  std::vector<float> cell_azimuth_deg;
-
-  // Per-cell ground range from radar (m) — for per-cell f computation.
-  std::vector<float> cell_range;
+  // Precomputed azimuthal smoothing weights (Brook et al. 2022 Eq. 3).
+  // Computed once during build, constant across CG iterations.
+  // Size: grid_nx * grid_ny. If empty, isotropic smoothing (Wx=Wy=1).
+  std::vector<float> Wx;
+  std::vector<float> Wy;
 
   auto grid_size() const -> size_t { return grid_nx * grid_ny; }
 };

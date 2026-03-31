@@ -48,7 +48,7 @@ auto precompute_grid_bearings(
 
   gb.n_bearing_bins = 720;
   gb.bearing_bin_size = 360.0f / gb.n_bearing_bins;
-  gb.range_bin_size = 250.0f;  // match typical range gate spacing
+  gb.range_bin_size = 250.0f;
   gb.n_range_bins = static_cast<size_t>(max_range / gb.range_bin_size) + 2;
   gb.max_range = max_range;
 
@@ -109,8 +109,39 @@ static auto lookup_nearest(
   return gb.bin_to_grid[bin_idx];
 }
 
-// Build observation operator with nearest-neighbour mapping.
-// Each gate maps to exactly 1 grid cell — fast and clean.
+// Precompute azimuthal weights Wx, Wy for each grid cell.
+// Called once during build — these are constant across CG iterations.
+static void precompute_azimuthal_weights(
+      observation_operator& H
+    , grid_bearings const& gb
+    , const vargrid_config& cfg
+    )
+{
+  size_t n = H.grid_size();
+  H.Wx.resize(n, 1.0f);
+  H.Wy.resize(n, 1.0f);
+
+  if (cfg.range_spacing <= 0.0f) return;
+
+  float bw_rad = cfg.beamwidth * static_cast<float>(M_PI / 180.0);
+
+  for (size_t i = 0; i < n; ++i) {
+    float cell_r = gb.cell_range[i];
+    if (cell_r < 20000.0f) continue;  // isotropic near the radar
+
+    float delta_phi = bw_rad * cell_r;
+    float f = cfg.range_spacing / delta_phi;
+    if (f > 1.0f) f = 1.0f;
+
+    float A = std::fabs(f - 1.0f) * 0.5f;
+    float C = (f + 1.0f) * 0.5f;
+    float cos2phi = std::cos(2.0f * gb.cell_bearing_deg[i] * static_cast<float>(M_PI / 180.0));
+
+    H.Wx[i] = C - A * cos2phi;
+    H.Wy[i] = C + A * cos2phi;
+  }
+}
+
 auto build_observation_operator(
       volume const& vol
     , grid_bearings const& gb
@@ -126,8 +157,9 @@ auto build_observation_operator(
   H.grid_ny = grid_ny;
   H.obs_count.resize(grid_nx * grid_ny, 0);
   H.kappa = cfg.kappa;
-  H.cell_azimuth_deg = gb.cell_bearing_deg;
-  H.cell_range = gb.cell_range;
+
+  // Precompute Wx/Wy — done once, constant across CG iterations
+  precompute_azimuthal_weights(H, gb, cfg);
 
   size_t topscan = 0;
   for (size_t iscan = 1; iscan < vol.sweeps.size(); iscan++) {
