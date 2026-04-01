@@ -171,13 +171,6 @@ vargrid/
 │       ├── solver.h                   — Polak-Ribière CG with cost-only line search (header-only)
 │       ├── variational.h/cc           — Variational gridding driver, BFS masking
 │       └── cappi.h/cc                 — CAPPI IDW gridding
-└── test/
-    ├── test_harness.h                 — Minimal test framework
-    ├── test_main.cc                   — Test runner
-    ├── test_laplacian.cc              — Laplacian operator verification
-    ├── test_cost_function.cc          — Gradient vs finite differences
-    ├── test_solver.cc                 — CG convergence tests
-    └── test_field_selection.cc        — Include/exclude logic
 ```
 
 ## License
