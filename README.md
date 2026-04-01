@@ -180,4 +180,4 @@ vargrid/
 
 ## License
 
-Copyright Commonwealth of Australia, Bureau of Meteorology. See LICENSE for details.
+See LICENSE for details.
