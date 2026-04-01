@@ -173,6 +173,11 @@ vargrid/
 │       └── cappi.h/cc                 — CAPPI IDW gridding
 ```
 
+## Acknowledgements
+
+- *Architectural Design*: Portions of the variational gridding and post-processing pipelines were developed with the assistance of Claude (Anthropic).
+- *Core Implementation*: The ODIM HDF5 reader, NetCDF writer, and original CAPPI gridding logic were authored by the primary maintainer.
+
 ## License
 
 Copyright Commonwealth of Australia, Bureau of Meteorology. See LICENSE for details.
