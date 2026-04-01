@@ -56,6 +56,7 @@ set(SOURCES
   src/gridding/cappi.cc
   src/gridding/observation_operator.cc
   src/gridding/variational.cc
+  src/post/steiner.cc
 )
 
 # --- Executable ---
