@@ -1,128 +1,137 @@
-#include "post_processor.h"
+#include "steiner.h"
 #include <cmath>
+#include <algorithm>
 
-namespace bom {
+using namespace bom;
 
-class steiner_classifier : public post_processor {
-public:
-    auto name() const -> std::string override { return "steiner"; }
-    auto required_fields() const -> std::vector<std::string> override { return {"DBZH"}; }
-    auto provided_fields() const -> std::vector<std::string> override { return {"STEINER_CLASS"}; }
-    auto process(
-        std::map<std::string, array2f>& layer_data, 
-        const post_processor_context& ctx, 
-        const io::configuration& config) -> void override 
-    {
-        const auto& ze_dbz = layer_data.at("DBZH");
-        auto [ny, nx] = ze_dbz.extents();
-        
-        // 0: No data/Undetect, 1: Stratiform, 2: Convective
-        array2f sclass{vec2z{ny, nx}};        
+auto steiner_classifier::process(
+    std::map<std::string, array2f>& layer_data,
+    const post_processor_context& ctx,
+    const io::configuration& config) -> void
+{
+  const auto& ze_dbz = layer_data.at("DBZH");
+  size_t ny = ctx.ny;
+  size_t nx = ctx.nx;
 
-        // Get parameters from config
-        float bkg_rad_m = std::stof(config.optional("steiner_bkg_rad", "11000.0"));
-        float intense_thr = std::stof(config.optional("steiner_intense_dbz", "42.0"));
-        std::string area_rel = config.optional("steiner_area_relation", "medium");
-        std::string peak_rel = config.optional("steiner_peak_relation", "default");
+  // 0: No data, 1: Stratiform, 2: Convective
+  auto sclass = array2f{vec2z{nx, ny}};
+  for (size_t i = 0; i < sclass.size(); ++i)
+    sclass.data()[i] = 0.0f;
 
-        // Pre-calculate search windows in pixels
-        int i_rad = std::ceil(bkg_rad_m / ctx.dx);
-        int j_rad = std::ceil(bkg_rad_m / ctx.dy);
+  // Parameters from config
+  float bkg_rad_m   = std::stof(std::string(config.optional("steiner_bkg_rad", "11000.0")));
+  float intense_thr = std::stof(std::string(config.optional("steiner_intense_dbz", "42.0")));
+  std::string area_rel = config.optional("steiner_area_relation", "medium");
+  std::string peak_rel = config.optional("steiner_peak_relation", "default");
 
-        for (int j = 0; j < ny; ++j) {
-            for (int i = 0; i < nx; ++i) {
-                float val = ze_dbz[j][i];
-                if (std::isnan(val) || val <= undetect) continue;
+  float bkg_rad_sq = bkg_rad_m * bkg_rad_m;
+  int i_rad = static_cast<int>(std::ceil(bkg_rad_m / ctx.dx));
+  int j_rad = static_cast<int>(std::ceil(bkg_rad_m / ctx.dy));
 
-                // 1. Calculate Background Reflectivity (Linear Average)
-                double sum_linear = 0.0;
-                int count = 0;
-                
-                for (int mj = std::max(0, j-j_rad); mj <= std::min((int)ny-1, j+j_rad); ++mj) {
-                    for (int mi = std::max(0, i-i_rad); mi <= std::min((int)nx-1, i+i_rad); ++mi) {
-                        float neighbor = ze_dbz[mj][mi];
-                        if (std::isnan(neighbor)) continue;
-                        
-                        // Distance check
-                        float dist_sq = std::pow((mi-i)*ctx.dx, 2) + std::pow((mj-j)*ctx.dy, 2);
-                        if (dist_sq <= bkg_rad_m * bkg_rad_m) {
-                            sum_linear += std::pow(10.0, neighbor / 10.0);
-                            count++;
-                        }
-                    }
-                }
+  for (size_t j = 0; j < ny; ++j) {
+    for (size_t i = 0; i < nx; ++i) {
+      float val = ze_dbz[j][i];
+      if (std::isnan(val) || val <= undetect) continue;
 
-                float ze_bkg = 10.0f * std::log10(sum_linear / count);
+      // 1. Background reflectivity (linear average in Z-space)
+      double sum_linear = 0.0;
+      int count = 0;
 
-                // 2. Convective Radius Calculation
-                float conv_rad = get_conv_radius(ze_bkg, area_rel);
-                
-                // 3. Peakedness Check
-                float peak_req = get_peakedness(ze_bkg, peak_rel);
+      int j0 = std::max(0, static_cast<int>(j) - j_rad);
+      int j1 = std::min(static_cast<int>(ny) - 1, static_cast<int>(j) + j_rad);
+      int i0 = std::max(0, static_cast<int>(i) - i_rad);
+      int i1 = std::min(static_cast<int>(nx) - 1, static_cast<int>(i) + i_rad);
 
-                if (val >= intense_thr || (val - ze_bkg) >= peak_req) {
-                    // Mark as convective and fill surrounding radius
-                    fill_convective(sclass, i, j, conv_rad, ctx);
-                } else if (sclass[j][i] == 0) {
-                    sclass[j][i] = 1; // Stratiform
-                }
-            }
+      for (int mj = j0; mj <= j1; ++mj) {
+        for (int mi = i0; mi <= i1; ++mi) {
+          float neighbor = ze_dbz[mj][mi];
+          if (std::isnan(neighbor)) continue;
+
+          float dist_sq = static_cast<float>((mi - (int)i)) * ctx.dx * static_cast<float>((mi - (int)i)) * ctx.dx
+                        + static_cast<float>((mj - (int)j)) * ctx.dy * static_cast<float>((mj - (int)j)) * ctx.dy;
+          if (dist_sq <= bkg_rad_sq) {
+            sum_linear += std::pow(10.0, neighbor / 10.0);
+            count++;
+          }
         }
-        layer_data["STEINER_CLASS"] = std::move(sclass);
+      }
+
+      if (count == 0) continue;
+      float ze_bkg = 10.0f * static_cast<float>(std::log10(sum_linear / count));
+
+      // 2. Convective radius
+      float conv_rad = get_conv_radius(ze_bkg, area_rel);
+
+      // 3. Peakedness check
+      float peak_req = get_peakedness(ze_bkg, peak_rel);
+
+      if (val >= intense_thr || (val - ze_bkg) >= peak_req) {
+        fill_convective(sclass, static_cast<int>(i), static_cast<int>(j), conv_rad, ctx);
+      } else if (sclass[j][i] == 0.0f) {
+        sclass[j][i] = 1.0f;  // Stratiform
+      }
     }
+  }
 
-private:
-    float get_conv_radius(float bkg, const std::string& rel) {
-        if (rel == "small") {
-            if (bkg < 30) return 1000;
-            if (bkg < 35) return 2000;
-            if (bkg < 40) return 3000;
-            if (bkg < 45) return 4000;
-            return 5000;
-        } else if (rel == "medium") {
-            if (bkg < 25) return 1000;
-            if (bkg < 30) return 2000;
-            if (bkg < 35) return 3000;
-            if (bkg < 40) return 4000;
-            return 5000;
-        } else if (rel == "large") {
-            if (bkg < 20) return 1000;
-            if (bkg < 25) return 2000;
-            if (bkg < 30) return 3000;
-            if (bkg < 35) return 4000;
-            return 5000;
-        } else if (rel == "scp") {        
-            if (bkg < 40) return 0;
-            if (bkg < 45) return 1000;
-            if (bkg < 50) return 2000;
-            if (bkg < 55) return 6000;
-            return 8000;
-        } else {
-            throw std::runtime_error("Invalid peak_relation: " + std::string(rel));
-        }
+  layer_data["STEINER_CLASS"] = std::move(sclass);
+}
+
+auto steiner_classifier::get_conv_radius(float bkg, const std::string& rel) -> float
+{
+  if (rel == "small") {
+    if (bkg < 30) return 1000; 
+    if (bkg < 35) return 2000;
+    if (bkg < 40) return 3000; 
+    if (bkg < 45) return 4000; 
+    return 5000;
+  } else if (rel == "medium") {
+    if (bkg < 25) return 1000; 
+    if (bkg < 30) return 2000;
+    if (bkg < 35) return 3000; 
+    if (bkg < 40) return 4000; 
+    return 5000;
+  } else if (rel == "large") {
+    if (bkg < 20) return 1000; 
+    if (bkg < 25) return 2000;
+    if (bkg < 30) return 3000; 
+    if (bkg < 35) return 4000; 
+    return 5000;
+  } else if (rel == "scp") {
+    if (bkg < 40) return 0; 
+    if (bkg < 45) return 1000;
+    if (bkg < 50) return 2000; 
+    if (bkg < 55) return 6000; 
+    return 8000;
+  }
+  throw std::runtime_error("Invalid steiner_area_relation: " + rel);
+}
+
+auto steiner_classifier::get_peakedness(float bkg, const std::string& rel) -> float
+{
+  if (bkg < 0)     return (rel == "sgp") ? 14.0f : 10.0f;
+  if (bkg >= 42.43f) return (rel == "sgp") ? 4.0f : 0.0f;
+  float base = (rel == "sgp") ? 14.0f : 10.0f;
+  return base - bkg * bkg / 180.0f;
+}
+
+auto steiner_classifier::fill_convective(
+    array2f& sclass, int ci, int cj, float rad,
+    const post_processor_context& ctx) -> void
+{
+  if (rad <= 0.0f) return;
+
+  int i_rad = static_cast<int>(std::ceil(rad / ctx.dx));
+  int j_rad = static_cast<int>(std::ceil(rad / ctx.dy));
+  int ny = static_cast<int>(ctx.ny);
+  int nx = static_cast<int>(ctx.nx);
+  float rad_sq = rad * rad;
+
+  for (int j = std::max(0, cj - j_rad); j <= std::min(ny - 1, cj + j_rad); ++j) {
+    for (int i = std::max(0, ci - i_rad); i <= std::min(nx - 1, ci + i_rad); ++i) {
+      float di = static_cast<float>(i - ci) * ctx.dx;
+      float dj = static_cast<float>(j - cj) * ctx.dy;
+      if (di * di + dj * dj <= rad_sq)
+        sclass[j][i] = 2.0f;
     }
-
-    float get_peakedness(float bkg, const std::string& rel) {
-        if (bkg < 0) return (rel == "sgp") ? 14.0f : 10.0f;
-        if (bkg >= 42.43) return (rel == "sgp") ? 4.0f : 0.0f;
-        float base = (rel == "sgp") ? 14.0f : 10.0f;
-        return base - std::pow(bkg, 2) / 180.0f;
-    }
-
-    void fill_convective(array2f& sclass, int ci, int cj, float rad, const post_processor_context& ctx) {
-        int i_rad = std::ceil(rad / ctx.dx);
-        int j_rad = std::ceil(rad / ctx.dy);
-        auto [ny, nx] = sclass.extents();
-
-        for (int j = std::max(0, cj-j_rad); j <= std::min((int)ny-1, cj+j_rad); ++j) {
-            for (int i = std::max(0, ci-i_rad); i <= std::min((int)nx-1, ci+i_rad); ++i) {
-                float dist_sq = std::pow((i-ci)*ctx.dx, 2) + std::pow((j-cj)*ctx.dy, 2);
-                if (dist_sq <= rad * rad) {
-                    sclass[j][i] = 2;
-                }
-            }
-        }
-    }
-};
-
-} // namespace bom
+  }
+}

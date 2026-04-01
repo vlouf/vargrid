@@ -143,7 +143,12 @@ static void generate_config(const char* odim_path)
             << "vargrid_use_nearest_init true\n"
             << "vargrid_kappa 0\n"
             << "vargrid_range_spacing 250\n"
-            << "vargrid_mask_distance 3\n";
+            << "vargrid_mask_distance 3\n"
+            << "\n"
+            << "# --- Post-processing (optional) ---\n"
+            << "# Space-separated list of algorithms to run after gridding.\n"
+            << "# Available: steiner\n"
+            << "# post_processors \"steiner\"\n";
 }
 static auto select_fields(
       std::vector<std::string> const& available
@@ -158,22 +163,22 @@ static auto select_fields(
   if (!include_str.empty()) {
     auto include_set = split_fields(include_str);
     for (auto& f : include_set)
-      if (!available_set.contains(f))
+      if (!available_set.count(f))
         trace::warning("include_fields: '{}' not found in input volume", f);
     std::vector<std::string> result;
     for (auto& f : available)
-      if (include_set.contains(f)) result.push_back(f);
+      if (include_set.count(f)) result.push_back(f);
     return result;
   }
 
   if (!exclude_str.empty()) {
     auto exclude_set = split_fields(exclude_str);
     for (auto& f : exclude_set)
-      if (!available_set.contains(f))
+      if (!available_set.count(f))
         trace::warning("exclude_fields: '{}' not found in input volume", f);
     std::vector<std::string> result;
     for (auto& f : available)
-      if (!exclude_set.contains(f)) result.push_back(f);
+      if (!exclude_set.count(f)) result.push_back(f);
     return result;
   }
 
@@ -292,11 +297,28 @@ static auto run_gridding(
   radar_lon[0] = first_vol.location.lon.degrees();
   radar_alt[0] = first_vol.location.alt;
 
+  // --- Post-processing pipeline ---
+  auto pipeline = create_post_pipeline(config);
+  std::vector<std::string> post_fields;
+  for (auto& pp : pipeline) {
+    trace::log("Post-processor: {} (requires: {}, provides: {})",
+      pp->name(),
+      [&]{ std::string s; for (auto& f : pp->required_fields()) { if (!s.empty()) s += " "; s += f; } return s; }(),
+      [&]{ std::string s; for (auto& f : pp->provided_fields()) { if (!s.empty()) s += " "; s += f; } return s; }());
+    for (auto& f : pp->provided_fields())
+      post_fields.push_back(f);
+  }
+
+  // All fields that will be in the output file = selected radar fields + post-processed fields
+  auto all_output_fields = selected_fields;
+  for (auto& f : post_fields)
+    all_output_fields.push_back(f);
+
   // --- Create output file ---
   trace::log("Creating output file: {}", out_path.string());
   auto [out_file, ctx] = create_output_file(
     out_path, coords, y_edges, lon, lat, altitudes, meta,
-    proj4_string, method, selected_fields, output_obs_count, pack_output,
+    proj4_string, method, all_output_fields, output_obs_count, pack_output,
     radar_lat, radar_lon, radar_alt);
 
   // --- Grid all fields at all layers ---
@@ -309,6 +331,12 @@ static auto run_gridding(
         altitudes.size());
     if (num_workers == 0) num_workers = 4;
 
+    // Compute grid spacing for post-processor context
+    auto col_edges = coords.col_edges();
+    auto row_edges = coords.row_edges();
+    float pp_dx = static_cast<float>(std::fabs(col_edges[1] - col_edges[0]));
+    float pp_dy = static_cast<float>(std::fabs(row_edges[1] - row_edges[0]));
+
     std::atomic<size_t> next_layer{0};
     std::atomic<size_t> completed_tasks{0};
     size_t total_tasks = altitudes.size() * selected_fields.size();
@@ -318,6 +346,9 @@ static auto run_gridding(
       while (true) {
         auto i = next_layer.fetch_add(1);
         if (i >= altitudes.size()) break;
+
+        // Accumulate all gridded fields for this layer
+        std::map<std::string, array2f> layer_data;
 
         for (auto& field : selected_fields) {
           auto& vol = volumes.at(field);
@@ -340,9 +371,34 @@ static auto run_gridding(
           }
 
           if (config["origin"].string() == "xy") flipud(gridded);
+          layer_data[field] = std::move(gridded);
+        }
 
+        // Run post-processing pipeline on the accumulated layer
+        if (!pipeline.empty()) {
+          post_processor_context pp_ctx{grid_nx, grid_ny, altitudes[i], pp_dx, pp_dy};
+          for (auto& pp : pipeline) {
+            // Check required fields are available
+            bool can_run = true;
+            for (auto& req : pp->required_fields()) {
+              if (layer_data.find(req) == layer_data.end()) {
+                trace::warning("Post-processor '{}' skipped: missing field '{}'", pp->name(), req);
+                can_run = false;
+                break;
+              }
+            }
+            if (can_run)
+              pp->process(layer_data, pp_ctx, config);
+          }
+        }
+
+        // Write all fields (gridded + post-processed)
+        {
           auto lock = std::lock_guard<std::mutex>{mut_netcdf};
-          ctx.write_field(field, gridded, i);
+          for (auto& [field, data] : layer_data) {
+            if (ctx.data_vars.count(field))
+              ctx.write_field(field, data, i);
+          }
         }
       }
     };

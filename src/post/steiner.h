@@ -3,50 +3,37 @@
 
 #include "post_processor.h"
 
-namespace bom {
-
-/**
- * @brief Steiner et al. (1995) Convective/Stratiform Classification.
- * * This algorithm identifies convective cores based on reflectivity 
- * peakedness relative to a background mean and marks a surrounding 
- * convective radius.
- */
+// Steiner et al. (1995) convective/stratiform classification.
+//
+// Identifies convective cores based on reflectivity peakedness relative
+// to a background mean and marks a surrounding convective radius.
+//
+// Required fields: DBZH
+// Produced fields: STEINER_CLASS (0=no data, 1=stratiform, 2=convective)
+//
+// Config parameters:
+//   steiner_bkg_rad       — background averaging radius in metres (default 11000)
+//   steiner_intense_dbz   — intensity threshold in dBZ (default 42)
+//   steiner_area_relation — "small", "medium", "large", or "scp" (default "medium")
+//   steiner_peak_relation — "default" or "sgp" (default "default")
 class steiner_classifier : public post_processor {
 public:
-    steiner_classifier() = default;
-    virtual ~steiner_classifier() = default;
+  auto name() const -> std::string override { return "steiner"; }
+  auto required_fields() const -> std::vector<std::string> override { return {"DBZH"}; }
+  auto provided_fields() const -> std::vector<std::string> override { return {"STEINER_CLASS"}; }
 
-    // Interface Implementation
-    auto name() const -> std::string override { return "steiner"; }
-    auto required_fields() const -> std::vector<std::string> override { return {"DBZH"}; }
-    auto provided_fields() const -> std::vector<std::string> override { return {"STEINER_CLASS"}; }
-
-    /**
-     * @brief Executes the Steiner classification on a 2D grid layer.
-     * @param layer_data Map of available fields; must contain "DBZH".
-     * @param ctx Metadata about the current grid layer (altitude, spacing).
-     * @param config The global configuration object for parameter lookup.
-     */
-    auto process(
-        std::map<std::string, array2f>& layer_data, 
-        const post_processor_context& ctx, 
-        const io::configuration& config
+  auto process(
+      std::map<std::string, bom::array2f>& layer_data
+    , const post_processor_context& ctx
+    , const bom::io::configuration& config
     ) -> void override;
 
 private:
-    // Internal math helpers
-    auto get_conv_radius(float bkg, const std::string& relation) -> float;
-    auto get_peakedness(float bkg, const std::string& relation) -> float;
-    
-    auto fill_convective(
-        array2f& sclass, 
-        int ci, 
-        int cj, 
-        float rad, 
-        const post_processor_context& ctx
-    ) -> void;
+  static auto get_conv_radius(float bkg, const std::string& relation) -> float;
+  static auto get_peakedness(float bkg, const std::string& relation) -> float;
+  static auto fill_convective(
+      bom::array2f& sclass, int ci, int cj, float rad,
+      const post_processor_context& ctx) -> void;
 };
-
-} // namespace bom
 
 #endif // VARGRID_STEINER_H
