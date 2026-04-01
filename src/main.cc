@@ -12,6 +12,7 @@
 #include "grid.h"
 #include "gridding/variational.h"
 #include "gridding/cappi.h"
+#include "post/post_processor.h"
 
 using namespace bom;
 
@@ -157,22 +158,22 @@ static auto select_fields(
   if (!include_str.empty()) {
     auto include_set = split_fields(include_str);
     for (auto& f : include_set)
-      if (!available_set.count(f))
+      if (!available_set.contains(f))
         trace::warning("include_fields: '{}' not found in input volume", f);
     std::vector<std::string> result;
     for (auto& f : available)
-      if (include_set.count(f)) result.push_back(f);
+      if (include_set.contains(f)) result.push_back(f);
     return result;
   }
 
   if (!exclude_str.empty()) {
     auto exclude_set = split_fields(exclude_str);
     for (auto& f : exclude_set)
-      if (!available_set.count(f))
+      if (!available_set.contains(f))
         trace::warning("exclude_fields: '{}' not found in input volume", f);
     std::vector<std::string> result;
     for (auto& f : available)
-      if (!exclude_set.count(f)) result.push_back(f);
+      if (!exclude_set.contains(f)) result.push_back(f);
     return result;
   }
 
