@@ -2,32 +2,71 @@
 
 // Known packing ranges for ODIM quantities.
 // These are fixed ranges that cover the full physical range of each variable.
+// Prefix-based lookup: try exact match first, then strip suffixes at '_' boundaries,
+// then try base prefix (e.g. "PHIDP_PHIDO" → "PHIDP_PHIDO" → "PHIDP" → found).
+template<typename Map>
+static auto prefix_lookup(const Map& map, const std::string& key) -> typename Map::const_iterator
+{
+  // Exact match
+  auto it = map.find(key);
+  if (it != map.end()) return it;
+
+  // Try stripping from the last '_' backward
+  std::string prefix = key;
+  while (true) {
+    auto pos = prefix.rfind('_');
+    if (pos == std::string::npos) break;
+    prefix = prefix.substr(0, pos);
+    it = map.find(prefix);
+    if (it != map.end()) return it;
+  }
+
+  return map.end();
+}
+
 auto get_packing_info(const std::string& quantity) -> packing_info
 {
-  // {valid_min, valid_max, scale_factor (computed), add_offset (computed), enabled}
   static const std::unordered_map<std::string, std::pair<float, float>> ranges = {
+    // Reflectivity (dBZ)
     {"DBZH",       {-33.0f,  95.0f}},
-    {"DBZH_CLEAN", {-33.0f,  95.0f}},
     {"DBZV",       {-33.0f,  95.0f}},
     {"TH",         {-33.0f,  95.0f}},
     {"TV",         {-33.0f,  95.0f}},
+    // Velocity (m/s)
+    {"VRAD",       {-75.0f,  75.0f}},
     {"VRADH",      {-75.0f,  75.0f}},
     {"VRADDH",     {-75.0f,  75.0f}},
     {"VRADV",      {-75.0f,  75.0f}},
+    // Spectrum width (m/s)
+    {"WRAD",       {0.0f,    30.0f}},
     {"WRADH",      {0.0f,    30.0f}},
     {"WRADV",      {0.0f,    30.0f}},
+    // Dual-pol
     {"ZDR",        {-8.0f,   12.0f}},
     {"RHOHV",      {0.0f,     1.1f}},
     {"PHIDP",      {-180.0f, 180.0f}},
     {"KDP",        {-2.0f,   15.0f}},
+    // Quality
     {"SQI",        {0.0f,     1.0f}},
     {"SNR",        {-30.0f,  70.0f}},
     {"SNRH",       {-30.0f,  70.0f}},
     {"CCOR",       {-40.0f,  10.0f}},
     {"CCORH",      {-40.0f,  10.0f}},
+    // Attenuation
+    {"PIA",        {0.0f,    30.0f}},
+    // DSD parameters
+    {"NW",         {-1.0f,   10.0f}},
+    {"D0",         {0.0f,     5.0f}},
+    // Precipitation rate
+    {"RAIN",       {0.0f,   300.0f}},
+    {"SNOW",       {0.0f,   100.0f}},
+    // HID (integer-like but store as float)
+    {"HID",        {0.0f,    20.0f}},
+    // Temperature
+    {"TEMPERATURE", {-80.0f,  50.0f}},
   };
 
-  auto it = ranges.find(quantity);
+  auto it = prefix_lookup(ranges, quantity);
   if (it != ranges.end()) {
     packing_info pi;
     pi.valid_min = it->second.first;
@@ -43,33 +82,57 @@ auto get_packing_info(const std::string& quantity) -> packing_info
 auto set_cf_field_attributes(io::nc::variable& var, const std::string& quantity) -> void
 {
   static const std::unordered_map<std::string, std::tuple<std::string, std::string, std::string>> cf_map = {
+    // Reflectivity
     {"DBZH",       {"dBZ",           "equivalent_reflectivity_factor",                          "Horizontal reflectivity"}},
-    {"DBZH_CLEAN", {"dBZ",           "equivalent_reflectivity_factor",                          "Filtered horizontal reflectivity"}},
     {"DBZV",       {"dBZ",           "",                                                        "Vertical reflectivity"}},
     {"TH",         {"dBZ",           "",                                                        "Total power horizontal (uncorrected Z)"}},
     {"TV",         {"dBZ",           "",                                                        "Total power vertical (uncorrected Z)"}},
+    // Velocity
+    {"VRAD",       {"m s-1",         "radial_velocity_of_scatterers_away_from_instrument",      "Mean Doppler velocity"}},
     {"VRADH",      {"m s-1",         "radial_velocity_of_scatterers_away_from_instrument",      "Mean Doppler velocity (H)"}},
     {"VRADDH",     {"m s-1",         "radial_velocity_of_scatterers_away_from_instrument",      "Dealiased Doppler velocity (H)"}},
     {"VRADV",      {"m s-1",         "",                                                        "Mean Doppler velocity (V)"}},
+    // Spectrum width
+    {"WRAD",       {"m s-1",         "doppler_spectrum_width",                                  "Doppler spectrum width"}},
     {"WRADH",      {"m s-1",         "doppler_spectrum_width",                                  "Doppler spectrum width (H)"}},
     {"WRADV",      {"m s-1",         "doppler_spectrum_width",                                  "Doppler spectrum width (V)"}},
+    // Dual-pol
     {"ZDR",        {"dB",            "log_differential_reflectivity_hv",                        "Differential reflectivity"}},
     {"RHOHV",      {"1",             "cross_correlation_ratio_hv",                              "Cross-correlation coefficient"}},
     {"PHIDP",      {"degrees",       "differential_phase_hv",                                   "Differential phase"}},
     {"KDP",        {"degrees km-1",  "specific_differential_phase_hv",                          "Specific differential phase"}},
+    // Quality
     {"SQI",        {"1",             "",                                                        "Signal quality index"}},
     {"SNR",        {"dB",            "signal_to_noise_ratio",                                   "Signal-to-noise ratio"}},
     {"SNRH",       {"dB",            "signal_to_noise_ratio",                                   "Signal-to-noise ratio (H)"}},
     {"CCOR",       {"dB",            "",                                                        "Clutter correction"}},
     {"CCORH",      {"dB",            "",                                                        "Clutter correction (H)"}},
+    // Attenuation
+    {"PIA",        {"dB",            "",                                                        "Path-integrated attenuation"}},
+    // DSD parameters
+    {"NW",         {"log10(m-3 mm-1)", "",                                                      "Normalised intercept parameter"}},
+    {"D0",         {"mm",            "",                                                        "Median volume diameter"}},
+    // Precipitation
+    {"RAIN",       {"mm h-1",        "rainfall_rate",                                           "Rainfall rate"}},
+    {"SNOW",       {"mm h-1",        "snowfall_rate",                                           "Snowfall rate"}},
+    // Classification
+    {"HID",        {"1",             "",                                                        "Hydrometeor identification"}},
+    // Environment
+    {"TEMPERATURE", {"C",            "air_temperature",                                         "Temperature"}},
   };
 
-  auto it = cf_map.find(quantity);
+  auto it = prefix_lookup(cf_map, quantity);
   if (it != cf_map.end()) {
     auto& [units, standard_name, long_name] = it->second;
     if (!units.empty())         var.att_set("units", units);
     if (!standard_name.empty()) var.att_set("standard_name", standard_name);
-    if (!long_name.empty())     var.att_set("long_name", long_name);
+    // Use the matched long_name as a base, append the original quantity if it differs
+    if (!long_name.empty()) {
+      if (it->first == quantity)
+        var.att_set("long_name", long_name);
+      else
+        var.att_set("long_name", long_name + " (" + quantity + ")");
+    }
   } else {
     var.att_set("long_name", quantity);
   }
