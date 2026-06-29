@@ -1,6 +1,5 @@
 #include "post_processor.h"
 #include "steiner.h"
-#include "hid.h"
 #include <sstream>
 
 using namespace bom;
@@ -10,7 +9,6 @@ using namespace bom;
 static auto make_processor(const std::string& name) -> std::unique_ptr<post_processor>
 {
   if (name == "steiner") return std::make_unique<steiner_classifier>();
-  if (name == "hid")     return std::make_unique<hid_classifier>();
 
   throw std::runtime_error("Unknown post-processor: '" + name + "'. "
     "Available: steiner, hid");
