@@ -49,6 +49,7 @@ struct sweep {
   radar::beam_propagation beam;
   array1<bin_info>        bins;  // gate geometry at bin centers
   array1<angle>           rays;  // azimuth angles at ray centers
+  size_t                  ray_offset = 0; // index into volume time dimension for CF/Radial scans
   array2f                 data;  // [ray][bin] data values
 };
 
@@ -62,6 +63,7 @@ struct volume {
 struct volume_metadata {
   array1f elevation;
   array1f nyquist;
+  latlonalt location;
   string source;
   string date;
   string time;

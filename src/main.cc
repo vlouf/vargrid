@@ -59,17 +59,16 @@ static void generate_config(const char* odim_path)
 
   if (odim_path) {
     try {
-      io::odim::polar_volume vol{std::filesystem::path(odim_path), io_mode::read_only};
-      lat0 = vol.latitude();
-      lon0 = vol.longitude();
+      auto input_path = std::filesystem::absolute(std::filesystem::path(odim_path));
+      auto meta = read_metadata(input_path);
+      lat0 = meta.location.lat.degrees();
+      lon0 = meta.location.lon.degrees();
       lat1 = lat0 + 5.0;  // reasonable standard parallels for AEA
       lat2 = lat0 - 5.0;
 
-      const auto& attrs = vol.attributes();
-      std::string src = attrs["source"].get_string();
-      source_comment = "# Radar: " + src;
+      source_comment = "# Radar: " + meta.source;
     } catch (std::exception& err) {
-      std::cerr << "Warning: could not read ODIM file: " << err.what() << "\n"
+      std::cerr << "Warning: could not read input file: " << err.what() << "\n"
                 << "Using default radar position.\n";
     }
   }
@@ -209,7 +208,8 @@ static auto run_gridding(
     , std::filesystem::path const& out_path
     ) -> void
 {
-  trace::log("Input:  {}", input_path.string());
+  auto resolved_input = std::filesystem::absolute(input_path);
+  trace::log("Input:  {}", resolved_input.string());
   trace::log("Output: {}", out_path.string());
 
   // --- Set up grid ---
@@ -226,8 +226,7 @@ static auto run_gridding(
     grid_nx, grid_ny, altitudes.size(), altitudes[0], altitudes[altitudes.size()-1]);
 
   // --- Discover and select fields ---
-  io::odim::polar_volume vol_odim{input_path, io_mode::read_only};
-  auto available_fields = discover_fields(vol_odim);
+  auto available_fields = discover_fields(resolved_input);
   auto selected_fields = select_fields(available_fields, config);
 
   trace::log("Available fields: {}", [&]{
@@ -243,14 +242,14 @@ static auto run_gridding(
   }
 
   // --- Read metadata and volumes ---
-  auto meta = read_metadata(vol_odim);
+  auto meta = read_metadata(resolved_input);
   std::string velocity_field = config.optional("velocity", "VRADH");
 
   std::map<std::string, volume> volumes;
   {
     phase_timer t("Reading " + std::to_string(selected_fields.size()) + " moment(s)");
     for (auto& field : selected_fields) {
-      volumes[field] = read_moment_volume(vol_odim, field, velocity_field);
+      volumes[field] = read_moment_volume(resolved_input, field, velocity_field);
       trace::debug("  {} : {} sweeps", field, volumes[field].sweeps.size());
     }
   }
