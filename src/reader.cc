@@ -323,6 +323,12 @@ auto discover_fields(std::filesystem::path const& input_path) -> std::vector<std
 {
   try {
     auto file = io::nc::file{input_path.string(), io_mode::read_only};
+    // libnetcdf can successfully open any HDF5 file (including ODIM polar
+    // volumes), so verify this really is CF/Radial before trusting the
+    // discovery result — otherwise fall through to the ODIM reader.
+    if (!file.find_variable("range") || !file.find_variable("azimuth")
+        || !file.find_variable("time") || !file.find_variable("sweep_start_ray_index"))
+      throw std::runtime_error("not a CF/Radial file");
     return discover_cf_radial_fields(file);
   } catch (std::exception const&) {
     auto vol_odim = io::odim::polar_volume{input_path, io_mode::read_only};
