@@ -26,6 +26,29 @@ inline float pm_diffusivity(float diff_sq, float kappa_sq) {
   return 1.0f / (1.0f + diff_sq / kappa_sq);
 }
 
+// Azimuthally-varying smoothness weights (Brook et al. 2022 Eq. 3).
+// Wx/Wy are per-cell; an edge uses the mean of its two endpoints' weights so
+// the weighting is symmetric (required for the gradient to be the exact
+// derivative of the cost). Diagonal edges mix Wx and Wy evenly. Empty (or
+// wrongly sized) Wx/Wy means isotropic weighting.
+struct edge_weights {
+  const float* Wx = nullptr;
+  const float* Wy = nullptr;
+
+  explicit edge_weights(const observation_operator& H) {
+    if (H.Wx.size() == H.grid_size() && H.Wy.size() == H.grid_size()) {
+      Wx = H.Wx.data();
+      Wy = H.Wy.data();
+    }
+  }
+
+  float x(size_t a, size_t b) const { return Wx ? 0.5f * (Wx[a] + Wx[b]) : 1.0f; }
+  float y(size_t a, size_t b) const { return Wy ? 0.5f * (Wy[a] + Wy[b]) : 1.0f; }
+  float d(size_t a, size_t b) const {
+    return Wx ? 0.25f * (Wx[a] + Wy[a] + Wx[b] + Wy[b]) : 1.0f;
+  }
+};
+
 // === Cost-only evaluation (no gradient) ===
 inline auto evaluate_cost(
     const float* __restrict__ x,
@@ -43,6 +66,7 @@ inline auto evaluate_cost(
   }
 
   float Js = 0.0f;
+  const edge_weights W{H};
 
   if (H.kappa > 0.0f) {
     float kappa_sq = H.kappa * H.kappa;
@@ -51,11 +75,11 @@ inline auto evaluate_cost(
         size_t idx = j * nx + i;
         float c = x[idx];
         // Cardinal edges (right and down)
-        if (i < nx-1) { float d = c - x[idx+1];  Js += kappa_sq * std::log(1.0f + d*d/kappa_sq); }
-        if (j < ny-1) { float d = c - x[idx+nx]; Js += kappa_sq * std::log(1.0f + d*d/kappa_sq); }
+        if (i < nx-1) { float d = c - x[idx+1];  Js += W.x(idx, idx+1)  * kappa_sq * std::log(1.0f + d*d/kappa_sq); }
+        if (j < ny-1) { float d = c - x[idx+nx]; Js += W.y(idx, idx+nx) * kappa_sq * std::log(1.0f + d*d/kappa_sq); }
         // Diagonal edges (down-right and down-left)
-        if (i < nx-1 && j < ny-1) { float d = c - x[idx+nx+1]; Js += DIAG_W * kappa_sq * std::log(1.0f + d*d/kappa_sq); }
-        if (i > 0    && j < ny-1) { float d = c - x[idx+nx-1]; Js += DIAG_W * kappa_sq * std::log(1.0f + d*d/kappa_sq); }
+        if (i < nx-1 && j < ny-1) { float d = c - x[idx+nx+1]; Js += DIAG_W * W.d(idx, idx+nx+1) * kappa_sq * std::log(1.0f + d*d/kappa_sq); }
+        if (i > 0    && j < ny-1) { float d = c - x[idx+nx-1]; Js += DIAG_W * W.d(idx, idx+nx-1) * kappa_sq * std::log(1.0f + d*d/kappa_sq); }
       }
   } else {
     for (size_t j = 0; j < ny; ++j)
@@ -63,11 +87,11 @@ inline auto evaluate_cost(
         size_t idx = j * nx + i;
         float c = x[idx];
         // Cardinal edges (right and down)
-        if (i < nx-1) { float d = c - x[idx+1];  Js += d * d; }
-        if (j < ny-1) { float d = c - x[idx+nx]; Js += d * d; }
+        if (i < nx-1) { float d = c - x[idx+1];  Js += W.x(idx, idx+1)  * d * d; }
+        if (j < ny-1) { float d = c - x[idx+nx]; Js += W.y(idx, idx+nx) * d * d; }
         // Diagonal edges (down-right and down-left)
-        if (i < nx-1 && j < ny-1) { float d = c - x[idx+nx+1]; Js += DIAG_W * d * d; }
-        if (i > 0    && j < ny-1) { float d = c - x[idx+nx-1]; Js += DIAG_W * d * d; }
+        if (i < nx-1 && j < ny-1) { float d = c - x[idx+nx+1]; Js += DIAG_W * W.d(idx, idx+nx+1) * d * d; }
+        if (i > 0    && j < ny-1) { float d = c - x[idx+nx-1]; Js += DIAG_W * W.d(idx, idx+nx-1) * d * d; }
       }
   }
 
@@ -100,6 +124,7 @@ inline auto evaluate_gradient(
   }
 
   float Js = 0.0f;
+  const edge_weights W{H};
 
   if (H.kappa > 0.0f) {
     float kappa_sq = H.kappa * H.kappa;
@@ -110,22 +135,22 @@ inline auto evaluate_gradient(
         float g = 0.0f;
 
         // Cardinal neighbours
-        if (i < nx-1) { float d = c-x[idx+1];  g += pm_diffusivity(d*d,kappa_sq)*d; Js += kappa_sq*std::log(1.0f+d*d/kappa_sq); }
-        if (i > 0)    { float d = c-x[idx-1];  g += pm_diffusivity(d*d,kappa_sq)*d; }
-        if (j < ny-1) { float d = c-x[idx+nx]; g += pm_diffusivity(d*d,kappa_sq)*d; Js += kappa_sq*std::log(1.0f+d*d/kappa_sq); }
-        if (j > 0)    { float d = c-x[idx-nx]; g += pm_diffusivity(d*d,kappa_sq)*d; }
+        if (i < nx-1) { float d = c-x[idx+1];  float w = W.x(idx, idx+1);  g += w*pm_diffusivity(d*d,kappa_sq)*d; Js += w*kappa_sq*std::log(1.0f+d*d/kappa_sq); }
+        if (i > 0)    { float d = c-x[idx-1];  g += W.x(idx, idx-1)*pm_diffusivity(d*d,kappa_sq)*d; }
+        if (j < ny-1) { float d = c-x[idx+nx]; float w = W.y(idx, idx+nx); g += w*pm_diffusivity(d*d,kappa_sq)*d; Js += w*kappa_sq*std::log(1.0f+d*d/kappa_sq); }
+        if (j > 0)    { float d = c-x[idx-nx]; g += W.y(idx, idx-nx)*pm_diffusivity(d*d,kappa_sq)*d; }
 
         // Diagonal neighbours (weight DIAG_W)
-        if (i<nx-1 && j<ny-1) { float d=c-x[idx+nx+1]; g+=DIAG_W*pm_diffusivity(d*d,kappa_sq)*d; Js+=DIAG_W*kappa_sq*std::log(1.0f+d*d/kappa_sq); }
-        if (i>0    && j<ny-1) { float d=c-x[idx+nx-1]; g+=DIAG_W*pm_diffusivity(d*d,kappa_sq)*d; Js+=DIAG_W*kappa_sq*std::log(1.0f+d*d/kappa_sq); }
-        if (i<nx-1 && j>0)    { float d=c-x[idx-nx+1]; g+=DIAG_W*pm_diffusivity(d*d,kappa_sq)*d; }
-        if (i>0    && j>0)    { float d=c-x[idx-nx-1]; g+=DIAG_W*pm_diffusivity(d*d,kappa_sq)*d; }
+        if (i<nx-1 && j<ny-1) { float d=c-x[idx+nx+1]; float w=W.d(idx,idx+nx+1); g+=DIAG_W*w*pm_diffusivity(d*d,kappa_sq)*d; Js+=DIAG_W*w*kappa_sq*std::log(1.0f+d*d/kappa_sq); }
+        if (i>0    && j<ny-1) { float d=c-x[idx+nx-1]; float w=W.d(idx,idx+nx-1); g+=DIAG_W*w*pm_diffusivity(d*d,kappa_sq)*d; Js+=DIAG_W*w*kappa_sq*std::log(1.0f+d*d/kappa_sq); }
+        if (i<nx-1 && j>0)    { float d=c-x[idx-nx+1]; g+=DIAG_W*W.d(idx,idx-nx+1)*pm_diffusivity(d*d,kappa_sq)*d; }
+        if (i>0    && j>0)    { float d=c-x[idx-nx-1]; g+=DIAG_W*W.d(idx,idx-nx-1)*pm_diffusivity(d*d,kappa_sq)*d; }
 
         grad[idx] += 2.0f * lh * g;
       }
   } else {
-    // 8-connected isotropic Laplacian smoothness.
-    // Cardinal: weight 1.0,  Diagonal: weight 1/√2
+    // 8-connected Laplacian smoothness with azimuthal weights (Brook Eq. 2-3).
+    // Cardinal: weight Wx/Wy,  Diagonal: 1/√2 × mixed weight
     // Gradient: ∇Js[k] = 2 Σ_neighbours w_e (φ[k] - φ[neighbour])
     // Cost:     Js = Σ_edges w_e (φ_j - φ_k)² (each edge counted once)
 
@@ -136,16 +161,16 @@ inline auto evaluate_gradient(
         float g = 0.0f;
 
         // Cardinal neighbours (gradient from all 4, cost from right+down)
-        if (i > 0)    { g += c - x[idx-1]; }
-        if (i < nx-1) { float d = c - x[idx+1];  g += d; Js += d * d; }
-        if (j > 0)    { g += c - x[idx-nx]; }
-        if (j < ny-1) { float d = c - x[idx+nx]; g += d; Js += d * d; }
+        if (i > 0)    { g += W.x(idx, idx-1) * (c - x[idx-1]); }
+        if (i < nx-1) { float d = c - x[idx+1];  float w = W.x(idx, idx+1);  g += w * d; Js += w * d * d; }
+        if (j > 0)    { g += W.y(idx, idx-nx) * (c - x[idx-nx]); }
+        if (j < ny-1) { float d = c - x[idx+nx]; float w = W.y(idx, idx+nx); g += w * d; Js += w * d * d; }
 
         // Diagonal neighbours (gradient from all 4, cost from down-right+down-left)
-        if (i > 0    && j > 0)    { g += DIAG_W * (c - x[idx-nx-1]); }
-        if (i < nx-1 && j > 0)    { g += DIAG_W * (c - x[idx-nx+1]); }
-        if (i > 0    && j < ny-1) { float d = c - x[idx+nx-1]; g += DIAG_W * d; Js += DIAG_W * d * d; }
-        if (i < nx-1 && j < ny-1) { float d = c - x[idx+nx+1]; g += DIAG_W * d; Js += DIAG_W * d * d; }
+        if (i > 0    && j > 0)    { g += DIAG_W * W.d(idx, idx-nx-1) * (c - x[idx-nx-1]); }
+        if (i < nx-1 && j > 0)    { g += DIAG_W * W.d(idx, idx-nx+1) * (c - x[idx-nx+1]); }
+        if (i > 0    && j < ny-1) { float d = c - x[idx+nx-1]; float w = W.d(idx, idx+nx-1); g += DIAG_W * w * d; Js += DIAG_W * w * d * d; }
+        if (i < nx-1 && j < ny-1) { float d = c - x[idx+nx+1]; float w = W.d(idx, idx+nx+1); g += DIAG_W * w * d; Js += DIAG_W * w * d * d; }
 
         grad[idx] += 2.0f * lh * g;
       }
@@ -153,21 +178,6 @@ inline auto evaluate_gradient(
   }
 
   return Jo + lh * Js;
-}
-
-// Legacy — kept for unit tests
-inline void apply_laplacian(const float* x, float* Lx, size_t nx, size_t ny)
-{
-  for (size_t j = 0; j < ny; ++j)
-    for (size_t i = 0; i < nx; ++i) {
-      size_t idx = j * nx + i;
-      float c = x[idx], sum = 0.0f;
-      if (i > 0)      sum += c - x[idx-1];
-      if (i < nx - 1) sum += c - x[idx+1];
-      if (j > 0)      sum += c - x[idx-nx];
-      if (j < ny - 1) sum += c - x[idx+nx];
-      Lx[idx] = sum;
-    }
 }
 
 #endif // VARGRID_COST_FUNCTION_H

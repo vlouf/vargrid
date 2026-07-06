@@ -75,6 +75,7 @@ inline auto solve_cg(
     constexpr int max_ls = 20;
 
     float new_cost = cost;
+    bool accepted = false;
     for (int ls = 0; ls < max_ls; ++ls) {
       for (size_t i = 0; i < n; ++i)
         x_trial[i] = x[i] + step * direction[i];
@@ -82,10 +83,22 @@ inline auto solve_cg(
       // Cost-only evaluation — no gradient computation
       new_cost = evaluate_cost(x_trial.data(), H, cfg);
 
-      if (new_cost <= cost + c1 * step * dir_dot_grad)
+      if (new_cost <= cost + c1 * step * dir_dot_grad) {
+        accepted = true;
         break;
+      }
 
       step *= shrink;
+    }
+
+    // If the Armijo condition was never met, accept only a plain decrease;
+    // otherwise stop rather than committing a cost-increasing step.
+    if (!accepted && new_cost >= cost) {
+      result.iterations = iter;
+      result.final_cost = cost;
+      result.final_residual = std::sqrt(grad_norm_sq) / initial_grad_norm;
+      result.converged = false;
+      return result;
     }
 
     // Accept the step

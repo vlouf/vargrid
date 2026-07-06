@@ -17,6 +17,10 @@
 
 using namespace bom;
 
+#ifndef VARGRID_VERSION
+#define VARGRID_VERSION "0.1.0"
+#endif
+
 constexpr auto try_again = "try --help for usage instructions\n";
 constexpr auto usage_string =
 R"(Variational gridding of radar volume to Cartesian grid
@@ -37,14 +41,17 @@ available options:
       Set logging level [log]
         none | status | error | warning | log | debug
 
-Version: 0.1.0
-)";
+  -v, --version
+      Print version and exit
 
-constexpr auto short_options = "hgt:";
+Version: )" VARGRID_VERSION "\n";
+
+constexpr auto short_options = "hgvt:";
 constexpr struct option long_options[] =
 {
     { "help",     no_argument,       0, 'h' }
   , { "generate", no_argument,       0, 'g' }
+  , { "version",  no_argument,       0, 'v' }
   , { "trace",    required_argument, 0, 't' }
   , { 0, 0, 0, 0 }
 };
@@ -172,7 +179,15 @@ static void generate_config(const char* odim_path)
             << "# --- Post-processing (optional) ---\n"
             << "# Space-separated list of algorithms to run after gridding.\n"
             << "# Available: steiner\n"
-            << "# post_processors \"steiner\"\n";
+            << "# post_processors \"steiner\"\n"
+            << "\n"
+            << "# Steiner convective/stratiform classification parameters\n"
+            << "# steiner_bkg_rad 11000.0\n"
+            << "# steiner_intense_dbz 42.0\n"
+            << "# steiner_area_relation medium   # small | medium | large | scp\n"
+            << "# steiner_peak_relation default  # default | sgp\n"
+            << "# Classify at a single layer only (same reference as altitude_base):\n"
+            << "# steiner_altitude 2500\n";
 }
 static auto select_fields(
       std::vector<std::string> const& available
@@ -310,6 +325,12 @@ static auto run_gridding(
   auto vcfg = parse_vargrid_config(config, meta.beamwidth);
   auto output_obs_count = std::string(config.optional("output_obs_count", "false")) == "false" ? false : true;
   auto pack_output = std::string(config.optional("pack_output", "true")) == "false" ? false : true;
+  if (output_obs_count && method != "variational")
+    trace::warning("output_obs_count is only produced by the variational method; ignoring");
+
+  // CAPPI parameters (optional, with defaults matching the sample config)
+  float cappi_max_alt_dist = std::stof(config.optional("max_alt_dist", "20000"));
+  float cappi_idw_pwr = std::stof(config.optional("idw_pwr", "2.0"));
 
   // --- Precompute grid bearings (variational and leroi, main thread) ---
   grid_bearings gb;
@@ -399,10 +420,17 @@ static auto run_gridding(
     size_t total_tasks = altitudes.size() * selected_fields.size();
     std::mutex mut_netcdf;
 
+    // An uncaught exception in a worker thread would call std::terminate;
+    // catch, record the first error, and stop cleanly instead.
+    std::atomic<bool> failed{false};
+    std::string first_error;
+    std::mutex mut_error;
+
     auto worker = [&]() {
       while (true) {
         auto i = next_layer.fetch_add(1);
-        if (i >= altitudes.size()) break;
+        if (i >= altitudes.size() || failed.load()) break;
+        try {
 
         // Accumulate all gridded fields for this layer
         std::map<std::string, array2f> layer_data;
@@ -424,18 +452,26 @@ static auto run_gridding(
             }
           } else if (method == "leroi") {
             gridded = leroi_slice(leroi_pre, field, altitudes[i]);
+            auto done = completed_tasks.fetch_add(1) + 1;
+            trace::debug("  [{:3d}%] leroi: {} @ {:.0f}m",
+              static_cast<int>(100.0 * done / total_tasks), field, altitudes[i]);
           } else {
             gridded = generate_cappi(
-              vol, latlons, config["max_alt_dist"], config["idw_pwr"], altitudes[i]);
+              vol, latlons, cappi_max_alt_dist, cappi_idw_pwr, altitudes[i]);
+            auto done = completed_tasks.fetch_add(1) + 1;
+            trace::debug("  [{:3d}%] cappi: {} @ {:.0f}m",
+              static_cast<int>(100.0 * done / total_tasks), field, altitudes[i]);
           }
 
           if (config["origin"].string() == "xy") flipud(gridded);
           layer_data[field] = std::move(gridded);
         }
 
-        // Run post-processing pipeline on the accumulated layer
+        // Run post-processing pipeline on the accumulated layer.
+        // The context altitude is the user-facing layer value so options
+        // like steiner_altitude are expressed in the configured reference.
         if (!pipeline.empty()) {
-          post_processor_context pp_ctx{grid_nx, grid_ny, altitudes[i], pp_dx, pp_dy};
+          post_processor_context pp_ctx{grid_nx, grid_ny, out_altitudes[i], pp_dx, pp_dy};
           for (auto& pp : pipeline) {
             // Check required fields are available
             bool can_run = true;
@@ -459,6 +495,12 @@ static auto run_gridding(
               ctx.write_field(field, data, i);
           }
         }
+
+        } catch (std::exception& err) {
+          failed.store(true);
+          auto lock = std::lock_guard<std::mutex>{mut_error};
+          if (first_error.empty()) first_error = err.what();
+        }
       }
     };
 
@@ -467,6 +509,9 @@ static auto run_gridding(
       threads.emplace_back(worker);
     for (auto& t : threads)
       t.join();
+
+    if (failed.load())
+      throw std::runtime_error("gridding failed: " + first_error);
   }
 }
 
@@ -482,6 +527,7 @@ int main(int argc, char* argv[])
       if (c == -1) break;
       switch (c) {
       case 'h': std::cout << usage_string; return EXIT_SUCCESS;
+      case 'v': std::cout << "vargrid " VARGRID_VERSION "\n"; return EXIT_SUCCESS;
       case 'g': do_generate = true; break;
       case 't': trace::set_min_level(from_string<trace::level>(optarg)); break;
       case '?': std::cerr << try_again; return EXIT_FAILURE;

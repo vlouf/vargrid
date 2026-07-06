@@ -1,5 +1,9 @@
 #include "writer.h"
 
+#ifndef VARGRID_VERSION
+#define VARGRID_VERSION "0.1.0"
+#endif
+
 // Known packing ranges for ODIM quantities.
 // These are fixed ranges that cover the full physical range of each variable.
 // Prefix-based lookup: try exact match first, then strip suffixes at '_' boundaries,
@@ -146,7 +150,7 @@ auto set_cf_coord_attributes(io::nc::variable& var, const std::string& coord_typ
   static const std::unordered_map<std::string, std::tuple<std::string, std::string, std::string>> attrs = {
     {"latitude",        {"degrees_north", "latitude",                  ""}},
     {"longitude",       {"degrees_east",  "longitude",                 ""}},
-    {"altitude",        {"m",             "projection_z_coordinate",   ""}},
+    {"altitude",        {"m",             "altitude",                  ""}},
     {"nyquist",         {"m s-1",         "",                          "Nyquist velocity"}},
     {"radar_latitude",  {"degrees_north", "",                          "Origin latitude of the radar"}},
     {"radar_longitude", {"degrees_east",  "",                          "Origin longitude of the radar"}},
@@ -247,7 +251,7 @@ auto create_output_file(
   out_file.att_set("title", "Radar volume gridded to Cartesian coordinates");
   out_file.att_set("institution", "Bureau of Meteorology");
   out_file.att_set("source", meta.source);
-  out_file.att_set("history", "Created by vargrid 0.1.0");
+  out_file.att_set("history", "Created by vargrid " VARGRID_VERSION);
   out_file.att_set("date", meta.date);
   out_file.att_set("time", meta.time);
   out_file.att_set("lowest_sweep_time", meta.lowest_sweep_time);
@@ -284,6 +288,8 @@ auto create_output_file(
   var_a.att_set("positive", "up");
   var_a.att_set("long_name", altitude_reference == "radar"
     ? "height above radar station" : "height above mean sea level");
+  if (altitude_reference == "radar")
+    var_a.att_set("standard_name", "height");  // CF: height above a reference point
   set_cf_coord_attributes(var_lon, "longitude");
   set_cf_coord_attributes(var_lat, "latitude");
   set_cf_coord_attributes(var_nyq, "nyquist");
@@ -335,7 +341,10 @@ auto create_output_file(
         trace::debug("  {} unpacked (unknown field)", field);
     }
 
-    if (output_obs_count) {
+    // Observation counts are only produced by the variational method;
+    // creating the variables for other methods left never-written
+    // fill-value fields in the output.
+    if (output_obs_count && method == "variational") {
       auto nobs_name = "nobs_" + field;
       auto& nvar = out_file.create_variable(nobs_name, io::nc::data_type::f32,
         {&dim_a, &dim_y, &dim_x}, {1, dim_y.size(), dim_x.size()});

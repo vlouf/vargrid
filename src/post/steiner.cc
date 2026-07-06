@@ -23,6 +23,18 @@ auto steiner_classifier::process(
   float intense_thr = std::stof(std::string(config.optional("steiner_intense_dbz", "42.0")));
   std::string area_rel = config.optional("steiner_area_relation", "medium");
   std::string peak_rel = config.optional("steiner_peak_relation", "default");
+  if (peak_rel != "default" && peak_rel != "sgp")
+    throw std::runtime_error("Invalid steiner_peak_relation: '" + peak_rel
+      + "' (expected 'default' or 'sgp')");
+
+  // Optionally classify only at one altitude layer (classification is
+  // usually wanted at a single level, e.g. 2500 m).
+  std::string alt_str = config.optional("steiner_altitude", "");
+  if (!alt_str.empty()) {
+    float target = std::stof(alt_str);
+    if (std::fabs(ctx.altitude - target) > 0.5f)
+      return;  // not this layer; variable stays at _FillValue
+  }
 
   float bkg_rad_sq = bkg_rad_m * bkg_rad_m;
   int i_rad = static_cast<int>(std::ceil(bkg_rad_m / ctx.dx));
@@ -31,7 +43,7 @@ auto steiner_classifier::process(
   for (size_t j = 0; j < ny; ++j) {
     for (size_t i = 0; i < nx; ++i) {
       float val = ze_dbz[j][i];
-      if (std::isnan(val) || val <= undetect) continue;
+      if (std::isnan(val)) continue;
 
       // 1. Background reflectivity (linear average in Z-space)
       double sum_linear = 0.0;

@@ -1,30 +1,8 @@
 #include "reader.h"
 
 #include <limits>
-#include <optional>
 
 namespace {
-
-struct cf_radial_context {
-  io::nc::file file;
-  std::vector<std::string> field_names;
-};
-
-auto maybe_read_double_attribute(io::nc::object const& obj, std::string const& name) -> std::optional<double>
-{
-  if (!obj.att_exists(name)) return std::nullopt;
-  double value = 0.0;
-  obj.att_get(name, value);
-  return value;
-}
-
-auto maybe_read_float_attribute(io::nc::object const& obj, std::string const& name) -> std::optional<float>
-{
-  if (!obj.att_exists(name)) return std::nullopt;
-  float value = 0.0f;
-  obj.att_get(name, value);
-  return value;
-}
 
 static auto make_cf_field_aliases(std::string const& field) -> std::vector<std::string>
 {
@@ -60,18 +38,13 @@ static auto make_cf_field_aliases(std::string const& field) -> std::vector<std::
     for (auto const& alias : it->second) aliases.push_back(alias);
   }
 
-  std::sort(aliases.begin(), aliases.end());
-  aliases.erase(std::unique(aliases.begin(), aliases.end()), aliases.end());
-  return aliases;
-}
-
-static auto read_cf_radial_variable_value(io::nc::variable const& var, std::string const& name) -> double
-{
-  double value = 0.0;
-  if (var.att_exists(name)) {
-    var.att_get(name, value);
-  }
-  return value;
+  // Deduplicate but preserve order: the explicitly requested field name must
+  // be tried first, before any aliases.
+  std::set<std::string> seen;
+  std::vector<std::string> unique;
+  for (auto const& a : aliases)
+    if (seen.insert(a).second) unique.push_back(a);
+  return unique;
 }
 
 static auto get_var_shape(io::nc::variable const& var) -> std::vector<size_t>
@@ -118,11 +91,6 @@ static void rotate_scan_data_rows(sweep& scan, size_t shift)
   }
 
   std::rotate(scan.rays.begin(), scan.rays.begin() + shift, scan.rays.end());
-}
-
-static auto open_cf_radial_context(std::filesystem::path const& input_path) -> cf_radial_context
-{
-  return cf_radial_context{io::nc::file{input_path.string(), io_mode::read_only}, {}};
 }
 
 static auto discover_cf_radial_fields(io::nc::group const& group) -> std::vector<std::string>
@@ -224,13 +192,13 @@ static auto read_cf_radial_sweeps(io::nc::group const& group, volume_metadata& m
   if (sweep_start_vals.size() != sweep_end_vals.size() || sweep_start_vals.size() != fixed_angle_vals.size())
     throw std::runtime_error("CF/Radial sweep metadata is inconsistent");
 
-  var_range->read(range_vals);
-  var_azimuth->read(azimuth_vals);
-  var_elevation->read(elevation_vals);
-  var_fixed_angle->read(fixed_angle_vals);
-  var_sweep_start->read(sweep_start_vals);
-  var_sweep_end->read(sweep_end_vals);
-  var_time->read(time_vals);
+  // Validate ray index ranges before any size_t conversion: negative or
+  // out-of-range values from a malformed file must not wrap around.
+  for (size_t i = 0; i < sweep_start_vals.size(); ++i) {
+    if (sweep_start_vals[i] < 0 || sweep_end_vals[i] < 0
+        || static_cast<size_t>(sweep_end_vals[i]) >= azimuth_vals.size())
+      throw std::runtime_error("CF/Radial sweep ray indices are out of range");
+  }
 
   const size_t nsweeps = fixed_angle_vals.size();
   meta.elevation = array1f{nsweeps};
@@ -272,6 +240,10 @@ static auto read_cf_radial_sweeps(io::nc::group const& group, volume_metadata& m
   meta.beamwidth = 1.0f;
 
   for (size_t isweep = 0; isweep < nsweeps; ++isweep) {
+    // Skip vertical-pointing (birdbath) scans, matching the ODIM reader.
+    if (std::fabs(fixed_angle_vals[isweep] - 90.0f) < 0.1f)
+      continue;
+
     sweep scan;
     scan.beam = radar::beam_propagation{vol.location.alt, fixed_angle_vals[isweep] * 1_deg};
     scan.bins.resize(range_vals.size());
@@ -473,32 +445,52 @@ auto read_metadata(io::odim::polar_volume const& vol_odim) -> volume_metadata
       meta.nyquist[iscan] = -9999.f;
   }
 
-  // Lowest sweep time (midpoint of start/end)
-  auto elev = 90.f;
-  bom::timestamp stdate, eddate;
-  for (size_t iscan = nelev - 1; iscan > 0; --iscan) {
-    auto scan_odim = vol_odim.scan_open(iscan);
-    if (scan_odim.elevation_angle() < elev) {
-      stdate = bom::io::odim::strings_to_time(
+  // Lowest sweep time (midpoint of start/end of the lowest-elevation scan).
+  // The previous loop skipped scan 0 entirely — for ascending volumes that
+  // is precisely the lowest sweep — and underflowed when nelev was 0.
+  meta.lowest_sweep_time = "";
+  if (nelev > 0) {
+    size_t lowest = 0;
+    for (size_t i = 1; i < nelev; ++i)
+      if (meta.elevation[i] < meta.elevation[lowest])
+        lowest = i;
+    try {
+      auto scan_odim = vol_odim.scan_open(lowest);
+      auto stdate = bom::io::odim::strings_to_time(
         scan_odim.attributes()["startdate"].get_string(),
         scan_odim.attributes()["starttime"].get_string());
-      eddate = bom::io::odim::strings_to_time(
+      auto eddate = bom::io::odim::strings_to_time(
         scan_odim.attributes()["enddate"].get_string(),
         scan_odim.attributes()["endtime"].get_string());
+      meta.lowest_sweep_time = to_string(stdate + (eddate - stdate) / 2);
+    } catch (std::exception const&) {
+      trace::warning("Could not read start/end time of the lowest sweep");
     }
-    elev = scan_odim.elevation_angle();
   }
-  meta.lowest_sweep_time = to_string(stdate + (eddate - stdate) / 2);
 
-  // Global attributes
+  // Global attributes. Optional ones fall back to defaults instead of
+  // aborting the run (matches the CF/Radial reader's behaviour).
   const auto& attributes = vol_odim.attributes();
   meta.location.lat = vol_odim.latitude() * 1_deg;
   meta.location.lon = vol_odim.longitude() * 1_deg;
   meta.location.alt = vol_odim.height();
-  meta.source = attributes["source"].get_string();
-  meta.date = attributes["date"].get_string();
-  meta.time = attributes["time"].get_string();
-  meta.beamwidth = attributes["beamwH"].get_real();
+
+  auto get_str = [&](const char* name) -> std::string {
+    if (auto it = attributes.find(name); it != attributes.end())
+      return attributes[name].get_string();
+    trace::debug("ODIM attribute '{}' missing, using empty string", name);
+    return "";
+  };
+  meta.source = get_str("source");
+  meta.date = get_str("date");
+  meta.time = get_str("time");
+
+  if (auto it = attributes.find("beamwH"); it != attributes.end()) {
+    meta.beamwidth = attributes["beamwH"].get_real();
+  } else {
+    meta.beamwidth = 1.0f;
+    trace::debug("ODIM attribute 'beamwH' missing, assuming 1.0 deg beamwidth");
+  }
 
   return meta;
 }

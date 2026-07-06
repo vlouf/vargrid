@@ -4,6 +4,12 @@ project(vargrid VERSION 0.1.0 LANGUAGES CXX)
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
+# Default to an optimised build: the CG solver is ~10x slower unoptimised.
+if (NOT CMAKE_BUILD_TYPE AND NOT CMAKE_CONFIGURATION_TYPES)
+  set(CMAKE_BUILD_TYPE Release CACHE STRING "Build type" FORCE)
+  message(STATUS "No build type specified, defaulting to Release")
+endif()
+
 include(GNUInstallDirs)
 
 # --- Dependencies ---
@@ -65,6 +71,8 @@ set(SOURCES
 
 add_executable(vargrid ${SOURCES})
 
+target_compile_definitions(vargrid PRIVATE VARGRID_VERSION="${PROJECT_VERSION}")
+
 target_include_directories(vargrid PRIVATE
   ${CMAKE_CURRENT_SOURCE_DIR}/src
   ${DEP_INCLUDES}
@@ -80,6 +88,16 @@ target_link_libraries(vargrid PRIVATE
 
 if (UDUNITS2_FOUND)
   target_link_libraries(vargrid PRIVATE PkgConfig::UDUNITS2)
+endif()
+
+# --- Tests (dependency-free, off by default) ---
+
+option(VARGRID_BUILD_TESTS "Build unit tests" OFF)
+if (VARGRID_BUILD_TESTS)
+  enable_testing()
+  add_executable(test_leroi_core tests/test_leroi_core.cc)
+  target_include_directories(test_leroi_core PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+  add_test(NAME leroi_core COMMAND test_leroi_core)
 endif()
 
 # --- Install ---

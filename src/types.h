@@ -33,9 +33,12 @@
 
 using namespace bom;
 
-// Sentinel values for missing data
+// Sentinel values for missing data.
+// undetect marks "no echo" gates (ODIM undetect). It is chosen well outside
+// every physical data range: the previous value of -32.0 collided with valid
+// data (-32 dBZ weak echo, -32 m/s Doppler velocity) and silently masked it.
 constexpr float nodata = std::numeric_limits<float>::quiet_NaN();
-constexpr float undetect = -32.0f;
+constexpr float undetect = -9999.0f;
 
 // Radar gate geometry for a single range bin
 struct bin_info {

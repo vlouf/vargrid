@@ -11,7 +11,7 @@ static auto make_processor(const std::string& name) -> std::unique_ptr<post_proc
   if (name == "steiner") return std::make_unique<steiner_classifier>();
 
   throw std::runtime_error("Unknown post-processor: '" + name + "'. "
-    "Available: steiner, hid");
+    "Available: steiner");
 }
 
 auto create_post_pipeline(const io::configuration& config)

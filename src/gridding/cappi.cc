@@ -1,20 +1,34 @@
 #include "cappi.h"
 
 static auto find_ground_range_bin(array1<bin_info> const& bins, float target) -> size_t {
+  if (bins.size() < 2) return 0;
   float dr = bins[1].ground_range - bins[0].ground_range;
   if (dr <= 0) return 0;
-  size_t idx = std::round((target - bins[0].ground_range) / dr);
+  // Round in floating point and clamp BEFORE converting to size_t: a target
+  // below the first bin used to round to -1, wrap through size_t, and clamp
+  // to the LAST bin — handing near-radar cells data from maximum range.
+  float idxf = std::round((target - bins[0].ground_range) / dr);
+  if (idxf <= 0.0f) return 0;
+  size_t idx = static_cast<size_t>(idxf);
   if (idx >= bins.size()) return bins.size() - 1;
   return idx;
 }
 
+// Angular separation in degrees, accounting for the 360 wrap.
+static auto angle_sep_deg(angle a, angle b) -> double {
+  double d = std::fabs((a - b).degrees());
+  if (d > 180.0) d = 360.0 - d;
+  return d;
+}
+
 static auto find_ray(array1<angle> const& rays, angle target) -> size_t {
+  if (rays.size() < 2) return 0;
   auto ipos = std::upper_bound(rays.begin(), rays.end(), target);
-  if (ipos == rays.end()) return rays.size() - 1;
-  if (ipos == rays.begin()) return 0;
-  if (abs(*ipos - target) < abs(*(ipos - 1) - target))
-    return ipos - rays.begin();
-  return ipos - rays.begin() - 1;
+  // Nearest of the two bracketing rays, treating the array as circular so a
+  // bearing between the last and first ray resolves across the seam.
+  size_t hi = (ipos == rays.end()) ? 0 : static_cast<size_t>(ipos - rays.begin());
+  size_t lo = (hi == 0) ? rays.size() - 1 : hi - 1;
+  return angle_sep_deg(rays[hi], target) < angle_sep_deg(rays[lo], target) ? hi : lo;
 }
 
 auto generate_cappi(
@@ -27,12 +41,6 @@ auto generate_cappi(
     ) -> array2f
 {
   auto cappi = array2f{latlons.extents()};
-
-  size_t topscan = 0;
-  for (size_t iscan = 1; iscan < vol.sweeps.size(); iscan++) {
-    if (vol.sweeps[iscan].beam.elevation() > vol.sweeps[topscan].beam.elevation())
-      topscan = iscan;
-  }
 
   // Pre-sort sweep indices by elevation for early termination
   auto sorted_sweeps = std::vector<size_t>(vol.sweeps.size());
@@ -53,8 +61,10 @@ auto generate_cappi(
       float lwr_dist = nodata, upr_dist = nodata;
 
       for (auto iscan : sorted_sweeps) {
-        if (iscan == topscan) continue;
         auto& scan = vol.sweeps[iscan];
+        // Skip birdbath (vertical) scans; unlike the old "skip the highest
+        // sweep" heuristic this does not discard the top real tilt.
+        if (scan.beam.elevation().degrees() > 85.0) continue;
 
         auto ibin = find_ground_range_bin(scan.bins, br.second);
         if (ibin >= scan.bins.size()) continue;

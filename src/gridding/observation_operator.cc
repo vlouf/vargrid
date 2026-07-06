@@ -165,18 +165,14 @@ auto build_observation_operator(
   // Precompute Wx/Wy — done once, constant across CG iterations
   precompute_azimuthal_weights(H, gb, cfg);
 
-  size_t topscan = 0;
-  for (size_t iscan = 1; iscan < vol.sweeps.size(); iscan++) {
-    if (vol.sweeps[iscan].beam.elevation() > vol.sweeps[topscan].beam.elevation())
-      topscan = iscan;
-  }
-
   size_t total_obs = 0;
   size_t out_of_bounds = 0;
 
   for (size_t iscan = 0; iscan < vol.sweeps.size(); ++iscan) {
-    if (iscan == topscan) continue;
     auto& scan = vol.sweeps[iscan];
+    // Skip birdbath (vertical) scans; unlike the old "skip the highest
+    // sweep" heuristic this does not discard the top real tilt.
+    if (scan.beam.elevation().degrees() > 85.0) continue;
 
     for (size_t ibin = 0; ibin < scan.bins.size(); ++ibin) {
       float alt_dist = scan.bins[ibin].altitude - altitude;

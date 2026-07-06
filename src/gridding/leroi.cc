@@ -88,9 +88,9 @@ auto leroi_precompute(
   for (size_t s = 0; s < ns; ++s)
     geoms[s] = make_geometry(ref_vol.sweeps[sweep_idx[s]]);
 
-  // Radius of influence
+  // Radius of influence (unused by the bilinear stencil)
   float roi = cfg.roi;
-  if (roi <= 0.0f) {
+  if (cfg.weight != leroi::weight_type::bilinear && roi <= 0.0f) {
     float rmax = std::sqrt(gb.max_range * gb.max_range + max_altitude * max_altitude);
     roi = leroi::auto_roi(geoms, rmax);
     trace::log("leroi: radius of influence set to {:.0f} m", roi);
