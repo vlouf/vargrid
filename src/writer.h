@@ -66,6 +66,7 @@ auto create_output_file(
     , volume_metadata const& meta
     , const std::string& proj4_string
     , const std::string& method
+    , const std::string& altitude_reference  // "sea" or "radar"
     , const std::vector<std::string>& fields
     , bool output_obs_count
     , bool pack_output

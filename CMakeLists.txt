@@ -54,6 +54,7 @@ set(SOURCES
   src/writer.cc
   src/grid.cc
   src/gridding/cappi.cc
+  src/gridding/leroi.cc
   src/gridding/observation_operator.cc
   src/gridding/variational.cc
   src/post/pipeline.cc

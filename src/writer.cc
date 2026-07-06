@@ -228,6 +228,7 @@ auto create_output_file(
     , volume_metadata const& meta
     , const std::string& proj4_string
     , const std::string& method
+    , const std::string& altitude_reference
     , const std::vector<std::string>& fields
     , bool output_obs_count
     , bool pack_output
@@ -253,6 +254,8 @@ auto create_output_file(
   out_file.att_set("date_created", to_string(bom::timestamp::now()));
   out_file.att_set("projection", proj4_string);
   out_file.att_set("gridding_method", method);
+  out_file.att_set("altitude_reference", altitude_reference == "radar"
+    ? "height above radar station" : "height above mean sea level");
 
   // Dimensions
   auto& dim_x = io::cf::create_spatial_dimension(out_file, "x", "projection_x_coordinate", coords.col_units(), coords.col_edges());
@@ -279,6 +282,8 @@ auto create_output_file(
 
   set_cf_coord_attributes(var_a, "altitude");
   var_a.att_set("positive", "up");
+  var_a.att_set("long_name", altitude_reference == "radar"
+    ? "height above radar station" : "height above mean sea level");
   set_cf_coord_attributes(var_lon, "longitude");
   set_cf_coord_attributes(var_lat, "latitude");
   set_cf_coord_attributes(var_nyq, "nyquist");

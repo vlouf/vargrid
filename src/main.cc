@@ -12,6 +12,7 @@
 #include "grid.h"
 #include "gridding/variational.h"
 #include "gridding/cappi.h"
+#include "gridding/leroi.h"
 #include "post/post_processor.h"
 
 using namespace bom;
@@ -109,9 +110,15 @@ static void generate_config(const char* odim_path)
             << "altitude_step 500.0\n"
             << "layer_count 13\n"
             << "\n"
+            << "# Reference for the altitude layers:\n"
+            << "#   \"sea\"   - above mean sea level (default)\n"
+            << "#   \"radar\" - above the radar station altitude\n"
+            << "altitude_reference sea\n"
+            << "\n"
             << "# --- Gridding method ---\n"
             << "\n"
-            << "# \"variational\" (Brook et al. 2022 inspired) or \"cappi\" (IDW baseline)\n"
+            << "# \"variational\" (Brook et al. 2022 inspired), \"leroi\" (Dahl et al. 2019)\n"
+            << "# or \"cappi\" (IDW baseline)\n"
             << "gridding_method variational\n"
             << "\n"
             << "# --- Field selection (optional) ---\n"
@@ -143,6 +150,24 @@ static void generate_config(const char* odim_path)
             << "vargrid_kappa 0\n"
             << "vargrid_range_spacing 250\n"
             << "vargrid_mask_distance 3\n"
+            << "\n"
+            << "# --- Leroi parameters ---\n"
+            << "\n"
+            << "# Horizontal weighting: barnes | cressman | idw | bilinear\n"
+            << "# barnes/cressman/idw gather gates within the radius of influence;\n"
+            << "# bilinear uses the 4 enclosing gates (sharpest, no smoothing).\n"
+            << "leroi_weight barnes\n"
+            << "\n"
+            << "# Radius of influence in metres (0 = auto from azimuthal spacing)\n"
+            << "leroi_roi 0\n"
+            << "\n"
+            << "# Power for idw weighting\n"
+            << "leroi_idw_pwr 2.0\n"
+            << "\n"
+            << "# Snap lowest sweep to ground level (radar altitude ASL) if its\n"
+            << "# elevation angle (deg) <= this. Lets the lowest layers be filled\n"
+            << "# by the lowest tilt instead of being NaN below the beam.\n"
+            << "leroi_ground_elevation -999\n"
             << "\n"
             << "# --- Post-processing (optional) ---\n"
             << "# Space-separated list of algorithms to run after gridding.\n"
@@ -243,6 +268,27 @@ static auto run_gridding(
 
   // --- Read metadata and volumes ---
   auto meta = read_metadata(resolved_input);
+
+  // --- Altitude reference ---
+  // "sea": layers are ASL (default). "radar": layers are relative to the
+  // radar station altitude. Gridding always happens in ASL internally
+  // (gate altitudes include station height); the output z coordinate keeps
+  // the user-facing values.
+  std::string altitude_reference = config.optional("altitude_reference", "sea");
+  if (altitude_reference != "sea" && altitude_reference != "radar") {
+    trace::error("Invalid altitude_reference '{}'. Must be 'sea' or 'radar'.", altitude_reference);
+    return;
+  }
+  auto out_altitudes = array1f{altitudes.size()};  // written to the output z coordinate
+  for (size_t i = 0; i < altitudes.size(); ++i)
+    out_altitudes[i] = altitudes[i];
+  if (altitude_reference == "radar") {
+    float ralt = static_cast<float>(meta.location.alt);
+    for (size_t i = 0; i < altitudes.size(); ++i)
+      altitudes[i] += ralt;
+    trace::log("Altitude layers relative to radar ({:.0f}m ASL): gridding {:.0f}m to {:.0f}m ASL",
+      ralt, altitudes[0], altitudes[altitudes.size() - 1]);
+  }
   std::string velocity_field = config.optional("velocity", "VRADH");
 
   std::map<std::string, volume> volumes;
@@ -255,16 +301,20 @@ static auto run_gridding(
   }
 
   std::string method = config.optional("gridding_method", "cappi");
+  if (method != "variational" && method != "cappi" && method != "leroi") {
+    trace::error("Invalid gridding_method '{}'. Must be 'variational', 'leroi' or 'cappi'.", method);
+    return;
+  }
   trace::log("Gridding method: {}", method);
 
   auto vcfg = parse_vargrid_config(config, meta.beamwidth);
   auto output_obs_count = std::string(config.optional("output_obs_count", "false")) == "false" ? false : true;
   auto pack_output = std::string(config.optional("pack_output", "true")) == "false" ? false : true;
 
-  // --- Precompute grid bearings (variational only, main thread) ---
+  // --- Precompute grid bearings (variational and leroi, main thread) ---
   grid_bearings gb;
   float grid_spacing = 1000.0f;  // default, will be computed from config
-  if (method == "variational") {
+  if (method == "variational" || method == "leroi") {
     phase_timer t("Precomputing grid bearings");
     gb = precompute_grid_bearings(volumes.begin()->second.location, latlons);
 
@@ -273,6 +323,14 @@ static auto run_gridding(
     grid_spacing = static_cast<float>(std::fabs(col_edges[1] - col_edges[0]));
     trace::debug("Grid spacing: {:.0f}m, grid bearings computed for {}x{} cells",
       grid_spacing, grid_nx, grid_ny);
+  }
+
+  // --- Leroi volume-level precompute (horizontal sweep interpolation) ---
+  leroi_grids leroi_pre;
+  if (method == "leroi") {
+    phase_timer t("Leroi sweep interpolation");
+    auto lcfg = parse_leroi_config(config);
+    leroi_pre = leroi_precompute(volumes, gb, lcfg, altitudes[altitudes.size() - 1]);
   }
 
   // --- Prepare output coordinates ---
@@ -316,8 +374,8 @@ static auto run_gridding(
   // --- Create output file ---
   trace::log("Creating output file: {}", out_path.string());
   auto [out_file, ctx] = create_output_file(
-    out_path, coords, y_edges, lon, lat, altitudes, meta,
-    proj4_string, method, all_output_fields, output_obs_count, pack_output,
+    out_path, coords, y_edges, lon, lat, out_altitudes, meta,
+    proj4_string, method, altitude_reference, all_output_fields, output_obs_count, pack_output,
     radar_lat, radar_lon, radar_alt);
 
   // --- Grid all fields at all layers ---
@@ -364,6 +422,8 @@ static auto run_gridding(
               auto lock = std::lock_guard<std::mutex>{mut_netcdf};
               ctx.nobs_vars.at(field)->write(nobs, {i});
             }
+          } else if (method == "leroi") {
+            gridded = leroi_slice(leroi_pre, field, altitudes[i]);
           } else {
             gridded = generate_cappi(
               vol, latlons, config["max_alt_dist"], config["idw_pwr"], altitudes[i]);
