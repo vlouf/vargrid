@@ -126,7 +126,7 @@ static void generate_config(const char* odim_path)
             << "\n"
             << "# \"variational\" (Brook et al. 2022 inspired), \"leroi\" (Dahl et al. 2019)\n"
             << "# or \"cappi\" (IDW baseline)\n"
-            << "gridding_method variational\n"
+            << "gridding_method leroi\n"
             << "\n"
             << "# --- Field selection (optional) ---\n"
             << "# include_fields \"DBZH VRADH ZDR\"\n"
