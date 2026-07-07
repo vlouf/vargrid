@@ -34,9 +34,8 @@
 using namespace bom;
 
 // Sentinel values for missing data.
-// undetect marks "no echo" gates (ODIM undetect). It is chosen well outside
-// every physical data range: the previous value of -32.0 collided with valid
-// data (-32 dBZ weak echo, -32 m/s Doppler velocity) and silently masked it.
+// undetect marks "no echo" gates (ODIM undetect). It must stay well outside
+// physical radar data ranges to avoid masking valid values (e.g. -32 dBZ).
 constexpr float nodata = std::numeric_limits<float>::quiet_NaN();
 constexpr float undetect = -9999.0f;
 
@@ -72,6 +71,14 @@ struct volume_metadata {
   string time;
   string lowest_sweep_time;
   float beamwidth;
+};
+
+// Metadata copied from input moment variables (CF/Radial where available).
+struct variable_metadata {
+  string units;
+  string standard_name;
+  string long_name;
+  string description;
 };
 
 #endif // VARGRID_TYPES_H

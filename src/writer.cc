@@ -83,7 +83,11 @@ auto get_packing_info(const std::string& quantity) -> packing_info
   return {0, 0, 0, 0, false};
 }
 
-auto set_cf_field_attributes(io::nc::variable& var, const std::string& quantity) -> void
+auto set_cf_field_attributes(
+      io::nc::variable& var
+    , const std::string& quantity
+    , const variable_metadata* input_meta
+    ) -> void
 {
   static const std::unordered_map<std::string, std::tuple<std::string, std::string, std::string>> cf_map = {
     // Reflectivity
@@ -139,6 +143,18 @@ auto set_cf_field_attributes(io::nc::variable& var, const std::string& quantity)
     }
   } else {
     var.att_set("long_name", quantity);
+  }
+
+  // Preserve metadata from the input variable when available.
+  if (input_meta) {
+    if (!input_meta->units.empty())
+      var.att_set("units", input_meta->units);
+    if (!input_meta->standard_name.empty())
+      var.att_set("standard_name", input_meta->standard_name);
+    if (!input_meta->long_name.empty())
+      var.att_set("long_name", input_meta->long_name);
+    if (!input_meta->description.empty())
+      var.att_set("description", input_meta->description);
   }
 
   var.att_set("grid_mapping", "proj");
@@ -234,6 +250,7 @@ auto create_output_file(
     , const std::string& method
     , const std::string& altitude_reference
     , const std::vector<std::string>& fields
+    , const std::map<std::string, variable_metadata>& field_metadata
     , bool output_obs_count
     , bool pack_output
     , array1d const& radar_lat
@@ -310,12 +327,14 @@ auto create_output_file(
   for (auto& field : fields) {
     auto pi = get_packing_info(field);
     ctx.packing[field] = pi;
+    auto it_meta = field_metadata.find(field);
+    const variable_metadata* input_meta = it_meta != field_metadata.end() ? &it_meta->second : nullptr;
 
     if (pack_output && pi.enabled) {
       // Packed int16 variable
       auto& var = out_file.create_variable(field, io::nc::data_type::i16,
         {&dim_a, &dim_y, &dim_x}, {1, dim_y.size(), dim_x.size()});
-      set_cf_field_attributes(var, field);
+      set_cf_field_attributes(var, field, input_meta);
 
       // CF packing attributes — readers use: value = packed * scale_factor + add_offset
       var.att_set("scale_factor", static_cast<double>(pi.scale_factor));
@@ -332,7 +351,7 @@ auto create_output_file(
       // Float32 variable (unpacked, or unknown field)
       auto& var = out_file.create_variable(field, io::nc::data_type::f32,
         {&dim_a, &dim_y, &dim_x}, {1, dim_y.size(), dim_x.size()});
-      set_cf_field_attributes(var, field);
+      set_cf_field_attributes(var, field, input_meta);
       var.att_set("_FillValue", nodata);
 
       ctx.data_vars[field] = &var;

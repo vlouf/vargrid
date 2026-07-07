@@ -27,7 +27,11 @@ struct packing_info {
 auto get_packing_info(const std::string& quantity) -> packing_info;
 
 // Set CF-compliant attributes on a data variable based on the ODIM quantity name.
-auto set_cf_field_attributes(io::nc::variable& var, const std::string& quantity) -> void;
+auto set_cf_field_attributes(
+      io::nc::variable& var
+    , const std::string& quantity
+    , const variable_metadata* input_meta = nullptr
+    ) -> void;
 
 // Set CF-compliant attributes on a coordinate variable.
 auto set_cf_coord_attributes(io::nc::variable& var, const std::string& coord_type) -> void;
@@ -68,6 +72,7 @@ auto create_output_file(
     , const std::string& method
     , const std::string& altitude_reference  // "sea" or "radar"
     , const std::vector<std::string>& fields
+    , const std::map<std::string, variable_metadata>& field_metadata
     , bool output_obs_count
     , bool pack_output
     , array1d const& radar_lat

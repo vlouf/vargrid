@@ -392,11 +392,15 @@ static auto run_gridding(
   for (auto& f : post_fields)
     all_output_fields.push_back(f);
 
+  // Preserve metadata from the input variables for original radar fields.
+  auto field_metadata = read_field_metadata(resolved_input, selected_fields);
+
   // --- Create output file ---
   trace::log("Creating output file: {}", out_path.string());
   auto [out_file, ctx] = create_output_file(
     out_path, coords, y_edges, lon, lat, out_altitudes, meta,
-    proj4_string, method, altitude_reference, all_output_fields, output_obs_count, pack_output,
+    proj4_string, method, altitude_reference, all_output_fields, field_metadata,
+    output_obs_count, pack_output,
     radar_lat, radar_lon, radar_alt);
 
   // --- Grid all fields at all layers ---

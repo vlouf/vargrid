@@ -31,4 +31,10 @@ auto read_metadata(io::odim::polar_volume const& vol_odim) -> volume_metadata;
 // Extract volume-level metadata from a CF/Radial file.
 auto read_metadata(std::filesystem::path const& input_path) -> volume_metadata;
 
+// Extract per-field variable metadata (units, names, descriptions) from input.
+auto read_field_metadata(
+      std::filesystem::path const& input_path
+    , const std::vector<std::string>& fields
+    ) -> std::map<std::string, variable_metadata>;
+
 #endif // VARGRID_READER_H

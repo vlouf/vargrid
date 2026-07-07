@@ -1,6 +1,7 @@
 #include "reader.h"
 
 #include <limits>
+#include <optional>
 
 namespace {
 
@@ -53,6 +54,55 @@ static auto get_var_shape(io::nc::variable const& var) -> std::vector<size_t>
   for (auto const* dim : var.dimensions())
     shape.push_back(dim->size());
   return shape;
+}
+
+static auto read_optional_string_attribute(io::nc::variable const& var, const char* name) -> std::string
+{
+  std::string value;
+  try {
+    var.att_get(name, value);
+  } catch (std::exception const&) {
+    value.clear();
+  }
+  return value;
+}
+
+template <typename T>
+static auto read_optional_numeric_attribute(io::nc::variable const& var, const char* name) -> std::optional<double>
+{
+  T value{};
+  try {
+    var.att_get(name, value);
+    return static_cast<double>(value);
+  } catch (std::exception const&) {
+    return std::nullopt;
+  }
+}
+
+static auto read_optional_double_attribute(io::nc::variable const& var, const char* name) -> std::optional<double>
+{
+  if (auto v = read_optional_numeric_attribute<double>(var, name); v.has_value()) return v;
+  if (auto v = read_optional_numeric_attribute<float>(var, name); v.has_value()) return v;
+  if (auto v = read_optional_numeric_attribute<long long>(var, name); v.has_value()) return v;
+  if (auto v = read_optional_numeric_attribute<int>(var, name); v.has_value()) return v;
+  if (auto v = read_optional_numeric_attribute<short>(var, name); v.has_value()) return v;
+  if (auto v = read_optional_numeric_attribute<unsigned long long>(var, name); v.has_value()) return v;
+  if (auto v = read_optional_numeric_attribute<unsigned int>(var, name); v.has_value()) return v;
+  if (auto v = read_optional_numeric_attribute<unsigned short>(var, name); v.has_value()) return v;
+  return std::nullopt;
+}
+
+static auto is_missing_sentinel(float value, const std::vector<float>& sentinels) -> bool
+{
+  for (auto s : sentinels) {
+    if (!std::isfinite(s))
+      continue;
+    auto scale = std::max({1.0f, std::fabs(value), std::fabs(s)});
+    auto tol = 1.0e-5f * scale;
+    if (std::fabs(value - s) <= tol)
+      return true;
+  }
+  return false;
 }
 
 static auto normalize_scan_rays(sweep& scan) -> size_t
@@ -390,21 +440,78 @@ auto read_moment_volume(
       if (var) {
         auto shape = get_var_shape(*var);
         if (!shape.empty()) {
-          const size_t nrows = shape[0];
-          const size_t ncols = shape.size() > 1 ? shape[1] : 1;
-          std::vector<float> values(nrows * ncols);
+          std::vector<float> missing_sentinels;
+          const auto fill_value = read_optional_double_attribute(*var, "_FillValue");
+          const auto missing_value = read_optional_double_attribute(*var, "missing_value");
+          const auto scale_factor = read_optional_double_attribute(*var, "scale_factor");
+          const auto add_offset = read_optional_double_attribute(*var, "add_offset");
+          const bool has_packing = scale_factor.has_value() && add_offset.has_value();
+
+          auto add_missing = [&](double v) {
+            auto fv = static_cast<float>(v);
+            if (std::isfinite(fv))
+              missing_sentinels.push_back(fv);
+            if (scale_factor.has_value() && add_offset.has_value()) {
+              auto unpacked = static_cast<float>(v * scale_factor.value() + add_offset.value());
+              if (std::isfinite(unpacked))
+                missing_sentinels.push_back(unpacked);
+            }
+          };
+
+          if (fill_value.has_value()) add_missing(fill_value.value());
+          if (missing_value.has_value()) add_missing(missing_value.value());
+
+          if (shape.size() != 2)
+            continue;
+
+          const size_t dim0 = shape[0];
+          const size_t dim1 = shape[1];
+          std::vector<float> values(dim0 * dim1);
           var->read(values);
+
+          size_t total_rays = 0;
+          size_t max_gates = 0;
+          for (auto const& s : vol.sweeps) {
+            total_rays = std::max(total_rays, s.ray_offset + s.rays.size());
+            max_gates = std::max(max_gates, s.bins.size());
+          }
+
+          // CF/Radial moments are usually (time, range), but some files use
+          // (range, time). Detect and support both layouts.
+          enum class var_layout { time_range, range_time };
+          var_layout layout = var_layout::time_range;
+          if (dim0 == max_gates && dim1 == total_rays)
+            layout = var_layout::range_time;
+          else if (dim0 == total_rays && dim1 == max_gates)
+            layout = var_layout::time_range;
+          else if (dim0 == max_gates)
+            layout = var_layout::range_time;
+
+          const size_t time_len = (layout == var_layout::time_range) ? dim0 : dim1;
+          const size_t range_len = (layout == var_layout::time_range) ? dim1 : dim0;
 
           const size_t nsweeps = vol.sweeps.size();
           for (size_t isweep = 0; isweep < nsweeps; ++isweep) {
             auto& scan = vol.sweeps[isweep];
             for (size_t iray = 0; iray < scan.rays.size(); ++iray) {
               const size_t ray_index = scan.ray_offset + iray;
+              if (ray_index >= time_len)
+                continue;
               for (size_t igate = 0; igate < scan.bins.size(); ++igate) {
-                const size_t linear = ray_index * ncols + igate;
+                if (igate >= range_len)
+                  continue;
+                const size_t linear = (layout == var_layout::time_range)
+                  ? (ray_index * dim1 + igate)
+                  : (igate * dim1 + ray_index);
                 if (linear < values.size()) {
                   const auto value = values[linear];
-                  scan.data.data()[iray * scan.bins.size() + igate] = std::isfinite(value) ? value : nodata;
+                  const auto unpacked = has_packing
+                    ? static_cast<float>(value * scale_factor.value() + add_offset.value())
+                    : value;
+                  scan.data.data()[iray * scan.bins.size() + igate] =
+                    (std::isfinite(value) && !is_missing_sentinel(value, missing_sentinels))
+                    ? unpacked
+                    : nodata;
                 }
               }
             }
@@ -507,4 +614,47 @@ auto read_metadata(std::filesystem::path const& input_path) -> volume_metadata
     auto vol_odim = io::odim::polar_volume{input_path, io_mode::read_only};
     return read_metadata(vol_odim);
   }
+}
+
+auto read_field_metadata(
+      std::filesystem::path const& input_path
+    , const std::vector<std::string>& fields
+    ) -> std::map<std::string, variable_metadata>
+{
+  std::map<std::string, variable_metadata> out;
+
+  try {
+    auto file = io::nc::file{input_path.string(), io_mode::read_only};
+
+    // Only attempt CF/Radial variable metadata extraction.
+    if (!file.find_variable("range") || !file.find_variable("azimuth")
+        || !file.find_variable("time") || !file.find_variable("sweep_start_ray_index"))
+      throw std::runtime_error("not a CF/Radial file");
+
+    for (auto const& field : fields) {
+      const std::vector<std::string> aliases = make_cf_field_aliases(field);
+      for (auto const& alias : aliases) {
+        auto const* var = file.find_variable(alias);
+        if (!var)
+          continue;
+
+        variable_metadata meta;
+        meta.units = read_optional_string_attribute(*var, "units");
+        meta.standard_name = read_optional_string_attribute(*var, "standard_name");
+        meta.long_name = read_optional_string_attribute(*var, "long_name");
+        meta.description = read_optional_string_attribute(*var, "description");
+
+        if (meta.description.empty())
+          meta.description = read_optional_string_attribute(*var, "comment");
+
+        out[field] = std::move(meta);
+        break;
+      }
+    }
+  } catch (std::exception const&) {
+    // ODIM and unsupported formats typically do not provide CF variable
+    // metadata in a directly mappable form; leave per-field metadata empty.
+  }
+
+  return out;
 }
