@@ -33,3 +33,4 @@
 
 build/
 .vscode/settings.json
+tests/data/*
