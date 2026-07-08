@@ -6,6 +6,13 @@
 
 namespace {
 
+constexpr const char* kGridMappingVariableName = "proj";
+
+auto proj4_has_token(const std::string& proj4, const std::string& token) -> bool
+{
+  return proj4.find(token) != std::string::npos;
+}
+
 auto parse_cf_time_seconds(const volume_metadata& meta) -> double
 {
   // Prefer lowest sweep timestamp when available (ISO 8601 style).
@@ -45,7 +52,7 @@ auto parse_cf_time_seconds(const volume_metadata& meta) -> double
 // Known packing ranges for ODIM quantities.
 // These are fixed ranges that cover the full physical range of each variable.
 // Prefix-based lookup: try exact match first, then strip suffixes at '_' boundaries,
-// then try base prefix (e.g. "PHIDP_PHIDO" → "PHIDP_PHIDO" → "PHIDP" → found).
+// then try base prefix (e.g. "PHIDP_PHIDO" -> "PHIDP_PHIDO" -> "PHIDP" -> found).
 template<typename Map>
 static auto prefix_lookup(const Map& map, const std::string& key) -> typename Map::const_iterator
 {
@@ -212,7 +219,7 @@ auto set_cf_field_attributes(
   if (!has_units)
     var.att_set("units", "1");
 
-  var.att_set("grid_mapping", "albers_conical_equal_area");
+  var.att_set("grid_mapping", kGridMappingVariableName);
   var.att_set("coordinates", "time latitude longitude");
 }
 
@@ -328,7 +335,7 @@ auto create_output_file(
   out_file.att_set("source", source);
   out_file.att_set("history", "Created by vargrid " VARGRID_VERSION);
   out_file.att_set("references", "UNRAVEL processing documentation and CF conventions: https://doi.org/10.1175/JTECH-D-21-0006.1");
-  out_file.att_set("comment", "Georeferencing is CF-compliant via grid_mapping variable albers_conical_equal_area.");
+  out_file.att_set("comment", "Georeferencing is CF-compliant via grid_mapping variable 'proj'.");
   out_file.att_set("date_created", to_string(bom::timestamp::now()));
   out_file.att_set("projection", proj4_string);
   out_file.att_set("gridding_method", method);
@@ -358,7 +365,7 @@ auto create_output_file(
   auto& var_rlat = out_file.create_variable("radar_latitude", io::nc::data_type::f64, {&dim_nrad});
   auto& var_rlon = out_file.create_variable("radar_longitude", io::nc::data_type::f64, {&dim_nrad});
   auto& var_ralt = out_file.create_variable("radar_altitude", io::nc::data_type::f64, {&dim_nrad});
-  io::cf::create_grid_mapping(out_file, "albers_conical_equal_area", proj4_string, "", "m", "m");
+  io::cf::create_grid_mapping(out_file, kGridMappingVariableName, proj4_string, "", "m", "m");
 
   if (auto* var_x = out_file.find_variable("x")) {
     var_x->att_set("axis", "X");
@@ -369,10 +376,14 @@ auto create_output_file(
     var_y->att_set("long_name", "y coordinate of projection");
   }
 
-  if (auto* var_proj = out_file.find_variable("albers_conical_equal_area")) {
-    var_proj->att_set("semi_major_axis", 6378137.0);
-    var_proj->att_set("inverse_flattening", 298.257222101);
-    var_proj->att_set("reference_ellipsoid_name", "GRS 1980");
+  if (auto* var_proj = out_file.find_variable(kGridMappingVariableName)) {
+    const bool is_albers = proj4_has_token(proj4_string, "+proj=aea");
+    const bool is_grs80 = proj4_has_token(proj4_string, "+ellps=GRS80");
+    if (is_albers && is_grs80) {
+      var_proj->att_set("semi_major_axis", 6378137.0);
+      var_proj->att_set("inverse_flattening", 298.257222101);
+      var_proj->att_set("reference_ellipsoid_name", "GRS 1980");
+    }
   }
 
   var_t.att_set("standard_name", "time");
