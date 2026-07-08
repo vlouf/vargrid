@@ -4,6 +4,44 @@
 #define VARGRID_VERSION "0.1.0"
 #endif
 
+namespace {
+
+auto parse_cf_time_seconds(const volume_metadata& meta) -> double
+{
+  // Prefer lowest sweep timestamp when available (ISO 8601 style).
+  if (!meta.lowest_sweep_time.empty()) {
+    std::tm tm{};
+    int year = 0, mon = 0, mday = 0, hour = 0, min = 0, sec = 0;
+    if (std::sscanf(meta.lowest_sweep_time.c_str(), "%d-%d-%dT%d:%d:%d",
+        &year, &mon, &mday, &hour, &min, &sec) == 6) {
+      tm.tm_year = year - 1900;
+      tm.tm_mon = mon - 1;
+      tm.tm_mday = mday;
+      tm.tm_hour = hour;
+      tm.tm_min = min;
+      tm.tm_sec = sec;
+      return static_cast<double>(timegm(&tm));
+    }
+  }
+
+  // ODIM fallback: date="YYYYMMDD", time="HHMMSS".
+  if (meta.date.size() >= 8 && meta.time.size() >= 6) {
+    std::tm tm{};
+    tm.tm_year = std::stoi(meta.date.substr(0, 4)) - 1900;
+    tm.tm_mon = std::stoi(meta.date.substr(4, 2)) - 1;
+    tm.tm_mday = std::stoi(meta.date.substr(6, 2));
+    tm.tm_hour = std::stoi(meta.time.substr(0, 2));
+    tm.tm_min = std::stoi(meta.time.substr(2, 2));
+    tm.tm_sec = std::stoi(meta.time.substr(4, 2));
+    return static_cast<double>(timegm(&tm));
+  }
+
+  // Last resort: now.
+  return static_cast<double>(time(nullptr));
+}
+
+} // namespace
+
 // Known packing ranges for ODIM quantities.
 // These are fixed ranges that cover the full physical range of each variable.
 // Prefix-based lookup: try exact match first, then strip suffixes at '_' boundaries,
@@ -95,26 +133,33 @@ auto set_cf_field_attributes(
     {"DBZV",       {"dBZ",           "",                                                        "Vertical reflectivity"}},
     {"TH",         {"dBZ",           "",                                                        "Total power horizontal (uncorrected Z)"}},
     {"TV",         {"dBZ",           "",                                                        "Total power vertical (uncorrected Z)"}},
+    {"reflectivity", {"dBZ",         "equivalent_reflectivity_factor",                          "Reflectivity"}},
     // Velocity
     {"VRAD",       {"m s-1",         "radial_velocity_of_scatterers_away_from_instrument",      "Mean Doppler velocity"}},
     {"VRADH",      {"m s-1",         "radial_velocity_of_scatterers_away_from_instrument",      "Mean Doppler velocity (H)"}},
     {"VRADDH",     {"m s-1",         "radial_velocity_of_scatterers_away_from_instrument",      "Dealiased Doppler velocity (H)"}},
     {"VRADV",      {"m s-1",         "",                                                        "Mean Doppler velocity (V)"}},
+    {"velocity",   {"m s-1",         "radial_velocity_of_scatterers_away_from_instrument",      "Mean Doppler velocity"}},
     // Spectrum width
     {"WRAD",       {"m s-1",         "doppler_spectrum_width",                                  "Doppler spectrum width"}},
     {"WRADH",      {"m s-1",         "doppler_spectrum_width",                                  "Doppler spectrum width (H)"}},
     {"WRADV",      {"m s-1",         "doppler_spectrum_width",                                  "Doppler spectrum width (V)"}},
+    {"spectrum_width", {"m s-1",     "doppler_spectrum_width",                                  "Doppler spectrum width"}},
     // Dual-pol
     {"ZDR",        {"dB",            "log_differential_reflectivity_hv",                        "Differential reflectivity"}},
     {"RHOHV",      {"1",             "cross_correlation_ratio_hv",                              "Cross-correlation coefficient"}},
     {"PHIDP",      {"degrees",       "differential_phase_hv",                                   "Differential phase"}},
     {"KDP",        {"degrees km-1",  "specific_differential_phase_hv",                          "Specific differential phase"}},
+    {"differential_reflectivity", {"dB", "log_differential_reflectivity_hv",                    "Differential reflectivity"}},
+    {"differential_phase", {"degree", "differential_phase_hv",                                  "Differential phase"}},
     // Quality
     {"SQI",        {"1",             "",                                                        "Signal quality index"}},
     {"SNR",        {"dB",            "signal_to_noise_ratio",                                   "Signal-to-noise ratio"}},
     {"SNRH",       {"dB",            "signal_to_noise_ratio",                                   "Signal-to-noise ratio (H)"}},
     {"CCOR",       {"dB",            "",                                                        "Clutter correction"}},
     {"CCORH",      {"dB",            "",                                                        "Clutter correction (H)"}},
+    {"signal_to_noise_ratio", {"dB", "signal_to_noise_ratio",                                   "Signal-to-noise ratio"}},
+    {"signal_quality_index", {"1",    "",                                                       "Signal quality index"}},
     // Attenuation
     {"PIA",        {"dB",            "",                                                        "Path-integrated attenuation"}},
     // DSD parameters
@@ -127,12 +172,17 @@ auto set_cf_field_attributes(
     {"HID",        {"1",             "",                                                        "Hydrometeor identification"}},
     // Environment
     {"TEMPERATURE", {"C",            "air_temperature",                                         "Temperature"}},
+    {"total_power", {"dBZ",          "",                                                        "Total power"}},
   };
 
   auto it = prefix_lookup(cf_map, quantity);
+  bool has_units = false;
   if (it != cf_map.end()) {
     auto& [units, standard_name, long_name] = it->second;
-    if (!units.empty())         var.att_set("units", units);
+    if (!units.empty()) {
+      var.att_set("units", units);
+      has_units = true;
+    }
     if (!standard_name.empty()) var.att_set("standard_name", standard_name);
     // Use the matched long_name as a base, append the original quantity if it differs
     if (!long_name.empty()) {
@@ -147,8 +197,10 @@ auto set_cf_field_attributes(
 
   // Preserve metadata from the input variable when available.
   if (input_meta) {
-    if (!input_meta->units.empty())
+    if (!input_meta->units.empty()) {
       var.att_set("units", input_meta->units);
+      has_units = true;
+    }
     if (!input_meta->standard_name.empty())
       var.att_set("standard_name", input_meta->standard_name);
     if (!input_meta->long_name.empty())
@@ -157,8 +209,11 @@ auto set_cf_field_attributes(
       var.att_set("description", input_meta->description);
   }
 
-  var.att_set("grid_mapping", "proj");
-  var.att_set("coordinates", "latitude longitude");
+  if (!has_units)
+    var.att_set("units", "1");
+
+  var.att_set("grid_mapping", "albers_conical_equal_area");
+  var.att_set("coordinates", "time latitude longitude");
 }
 
 auto set_cf_coord_attributes(io::nc::variable& var, const std::string& coord_type) -> void
@@ -267,11 +322,13 @@ auto create_output_file(
   out_file.att_set("Conventions", "CF-1.10");
   out_file.att_set("title", "Radar volume gridded to Cartesian coordinates");
   out_file.att_set("institution", "Bureau of Meteorology");
-  out_file.att_set("source", meta.source);
+  auto source = meta.source.empty()
+    ? std::string{"BoM radar network, gridded from radar volumes"}
+    : std::string{"BoM radar network ("} + meta.source + "), gridded from radar volumes";
+  out_file.att_set("source", source);
   out_file.att_set("history", "Created by vargrid " VARGRID_VERSION);
-  out_file.att_set("date", meta.date);
-  out_file.att_set("time", meta.time);
-  out_file.att_set("lowest_sweep_time", meta.lowest_sweep_time);
+  out_file.att_set("references", "UNRAVEL processing documentation and CF conventions: https://doi.org/10.1175/JTECH-D-21-0006.1");
+  out_file.att_set("comment", "Georeferencing is CF-compliant via grid_mapping variable albers_conical_equal_area.");
   out_file.att_set("date_created", to_string(bom::timestamp::now()));
   out_file.att_set("projection", proj4_string);
   out_file.att_set("gridding_method", method);
@@ -283,6 +340,7 @@ auto create_output_file(
   auto& dim_y = io::cf::create_spatial_dimension(out_file, "y", "projection_y_coordinate", coords.row_units(), y_edges);
   auto& dim_e = out_file.create_dimension("elevation", meta.elevation.size());
   auto& dim_a = out_file.create_dimension("z", altitudes.size());
+  auto& dim_t = out_file.create_dimension("time", 1);
   auto& dim_nrad = out_file.create_dimension("nradar", 1);
   ctx.dim_x = &dim_x;
   ctx.dim_y = &dim_y;
@@ -291,6 +349,7 @@ auto create_output_file(
   ctx.dim_nrad = &dim_nrad;
 
   // Coordinate variables
+  auto& var_t = out_file.create_variable("time", io::nc::data_type::f64, {&dim_t});
   auto& var_e = out_file.create_variable("elevation", io::nc::data_type::f64, {&dim_e});
   auto& var_a = out_file.create_variable("z", io::nc::data_type::f64, {&dim_a});
   auto& var_lon = out_file.create_variable("longitude", io::nc::data_type::f32, {&dim_y, &dim_x}, {dim_y.size(), dim_x.size()});
@@ -299,10 +358,31 @@ auto create_output_file(
   auto& var_rlat = out_file.create_variable("radar_latitude", io::nc::data_type::f64, {&dim_nrad});
   auto& var_rlon = out_file.create_variable("radar_longitude", io::nc::data_type::f64, {&dim_nrad});
   auto& var_ralt = out_file.create_variable("radar_altitude", io::nc::data_type::f64, {&dim_nrad});
-  io::cf::create_grid_mapping(out_file, "proj", proj4_string, "", "m", "m");
+  io::cf::create_grid_mapping(out_file, "albers_conical_equal_area", proj4_string, "", "m", "m");
+
+  if (auto* var_x = out_file.find_variable("x")) {
+    var_x->att_set("axis", "X");
+    var_x->att_set("long_name", "x coordinate of projection");
+  }
+  if (auto* var_y = out_file.find_variable("y")) {
+    var_y->att_set("axis", "Y");
+    var_y->att_set("long_name", "y coordinate of projection");
+  }
+
+  if (auto* var_proj = out_file.find_variable("albers_conical_equal_area")) {
+    var_proj->att_set("semi_major_axis", 6378137.0);
+    var_proj->att_set("inverse_flattening", 298.257222101);
+    var_proj->att_set("reference_ellipsoid_name", "GRS 1980");
+  }
+
+  var_t.att_set("standard_name", "time");
+  var_t.att_set("units", "seconds since 1970-01-01T00:00:00Z");
+  var_t.att_set("calendar", "standard");
+  var_t.att_set("axis", "T");
 
   set_cf_coord_attributes(var_a, "altitude");
   var_a.att_set("positive", "up");
+  var_a.att_set("axis", "Z");
   var_a.att_set("long_name", altitude_reference == "radar"
     ? "height above radar station" : "height above mean sea level");
   if (altitude_reference == "radar")
@@ -314,6 +394,9 @@ auto create_output_file(
   set_cf_coord_attributes(var_rlon, "radar_longitude");
   set_cf_coord_attributes(var_ralt, "radar_altitude");
 
+  auto time_value = array1d{1};
+  time_value[0] = parse_cf_time_seconds(meta);
+  var_t.write(time_value);
   var_e.write(meta.elevation);
   var_a.write(altitudes);
   var_lon.write(lon);
