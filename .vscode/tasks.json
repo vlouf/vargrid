@@ -1,0 +1,98 @@
+{
+  "version": "2.0.0",
+  "tasks": [
+    {
+      "label": "cmake: configure",
+      "type": "shell",
+      "command": "cmake",
+      "args": [
+        "-S",
+        ".",
+        "-B",
+        "build",
+        "-DCMAKE_BUILD_TYPE=Release"
+      ],
+      "options": {
+        "cwd": "${workspaceFolder}"
+      },
+      "group": "build",
+      "problemMatcher": []
+    },
+    {
+      "label": "cmake: build",
+      "type": "shell",
+      "command": "cmake",
+      "args": [
+        "--build",
+        "build",
+        "--config",
+        "Release"
+      ],
+      "options": {
+        "cwd": "${workspaceFolder}"
+      },
+      "group": {
+        "kind": "build",
+        "isDefault": true
+      },
+      "dependsOn": [
+        "cmake: configure"
+      ],
+      "dependsOrder": "sequence",
+      "problemMatcher": [
+        "$gcc"
+      ]
+    },
+    {
+      "label": "smoke: odim",
+      "type": "shell",
+      "command": "bash",
+      "args": [
+        "-lc",
+        "mkdir -p build/test_outputs && build/vargrid -g tests/data/52_20240806_033500.pvol.h5 > build/test_outputs/smoke_odim.conf && build/vargrid -t warning build/test_outputs/smoke_odim.conf tests/data/52_20240806_033500.pvol.h5 build/test_outputs/odim_smoke.nc && test -s build/test_outputs/odim_smoke.nc"
+      ],
+      "options": {
+        "cwd": "${workspaceFolder}"
+      },
+      "dependsOn": [
+        "cmake: build"
+      ],
+      "dependsOrder": "sequence",
+      "problemMatcher": []
+    },
+    {
+      "label": "smoke: cfradial",
+      "type": "shell",
+      "command": "bash",
+      "args": [
+        "-lc",
+        "mkdir -p build/test_outputs && build/vargrid -g > build/test_outputs/smoke_cfradial.conf && build/vargrid -t warning build/test_outputs/smoke_cfradial.conf tests/data/9776HUB-PPIVol-20260519-002500.cfradial.nc build/test_outputs/cfradial_smoke.nc && test -s build/test_outputs/cfradial_smoke.nc"
+      ],
+      "options": {
+        "cwd": "${workspaceFolder}"
+      },
+      "dependsOn": [
+        "cmake: build"
+      ],
+      "dependsOrder": "sequence",
+      "problemMatcher": []
+    },
+    {
+      "label": "smoke: all",
+      "type": "shell",
+      "command": "echo",
+      "args": [
+        "Smoke suite complete"
+      ],
+      "options": {
+        "cwd": "${workspaceFolder}"
+      },
+      "dependsOn": [
+        "smoke: odim",
+        "smoke: cfradial"
+      ],
+      "dependsOrder": "sequence",
+      "problemMatcher": []
+    }
+  ]
+}
